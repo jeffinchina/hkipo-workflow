@@ -1,0 +1,16 @@
+{
+  "data_dir": "data/grey",
+  "official_state_db": "data/service/state.sqlite3",
+  "research_root": "data/service/research",
+  "enabled": false,
+  "providers": [
+    "辉立暗盘",
+    "富途暗盘"
+  ],
+  "calendar_refresh_seconds": 1800,
+  "proxy_url": null,
+  "private_config": "private/config.json",
+  "reply_db": "data/mobile/intake.sqlite3",
+  "background_collection": true,
+  "scan_seconds": 15
+}

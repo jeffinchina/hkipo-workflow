@@ -38,14 +38,16 @@ class IntakeTests(NoticesTests):
         self.add_event(dict(self.doc,event_id='history',url='https://www1.hkexnews.hk/b.pdf'),1)
         dispatch_official(self.state,self.flow)
         dispatch_official(self.state,self.flow)
-        self.assertEqual(len(self.sent),1)
+        self.assertEqual(len(self.sent),0)
+        result=dispatch_official(self.state,self.flow)
+        self.assertEqual(result[0]['status'],'retained_for_grey_analysis')
     def test_dispatch_role_evidence_and_unknown(self):
         d=dict(self.doc,title='配發結果');self.add_event(d)
         self.assertEqual(dispatch_official(self.state,self.flow)[0]['status'],'skipped_unassociated')
         evidence=dict(category='official_new_listing_table',role='allotment',url=d['url'],stock_code='00012',source_sha256='sha',locator='row1',source_url='https://www2.hkexnews.hk/New-Listings/New-Listing-Information/Main-Board?sc_lang=zh-HK')
         with patch('hkipo.service.SnapshotArchive.evidence',return_value=([evidence],[])):
             dispatch_official(self.state,self.flow,self.root/'snapshots')
-        self.assertEqual(len(self.sent),1)
+        self.assertEqual(len(self.sent),0)
     def test_ready_schedule_cached(self):
         self.ready()
         self.assertEqual(self.run_schedule()[0]['status'],'scheduled')
@@ -69,3 +71,16 @@ class IntakeTests(NoticesTests):
         self.add_event(dict(self.doc,event_id='delay',kind='exception',title='全球發售 延期'))
         self.run_schedule()
         self.assertEqual({r['status'] for r in self.store.rows('episode1')},{'cancelled'})
+
+    def test_allotment_facts_are_retained_by_handler_without_immediate_mail(self):
+        self.add_event(self.doc)
+        captured=[]
+        result=dispatch_official(self.state,self.flow,allotment_handler=lambda event,doc:(captured.append((event,doc)) or {'status':'retained_for_grey_analysis'}))
+        self.assertEqual(result[0]['status'],'retained_for_grey_analysis')
+        self.assertEqual(captured[0][1]['event_id'],'doc1')
+        self.assertEqual(self.sent,[])
+    def test_exception_notice_still_sends_immediately(self):
+        self.add_event(dict(self.doc,kind='exception',title='全球發售 延期'))
+        result=dispatch_official(self.state,self.flow)
+        self.assertEqual(len(self.sent),1)
+        self.assertEqual(result[0]['status'],'confirmed')

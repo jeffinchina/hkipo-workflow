@@ -33,6 +33,7 @@ class MobileSettings:
     official_state_db:str|None=None
     official_snapshot_dir:str|None=None
     research_root:str|None=None
+    grey_settings:str|None=None
     def __post_init__(self):
         if any(type(getattr(self,k)) is not bool for k in ('enable_deliveries','acceptance_mode','table_cover_authorized')):
             raise ValueError('Delivery switches must be JSON booleans')
@@ -60,6 +61,12 @@ class MobileService:
                 profile=json.loads(Path(settings.template_approval).read_text())
                 if not settings.acceptance_mode and profile.get('production_accepted') is not True:
                     return {'status':'blocked','reason':'real_mail_and_wechat_acceptance_required'}
+            grey=None;grey_result=None
+            if settings.enable_deliveries and settings.grey_settings:
+                from .grey_service import GreyService,GreySettings
+                grey=GreyService(GreySettings(**json.loads(Path(settings.grey_settings).read_text())),flow)
+                # Fixed-deadline reminders run before slower mailbox reads.
+                grey_result=grey.cycle()
             # Receive only registered reminders; no inbox-wide content reads.
             incoming=self.poller(replies,config.get('email',{}))
             alerts=[];drafts=[]
@@ -69,7 +76,8 @@ class MobileService:
                 reminders=ReminderStore(self.root/'reminders.sqlite3')
                 if settings.official_state_db:
                     from .notice_intake import dispatch_official,schedule_ready_offers
-                    alerts.extend(dispatch_official(settings.official_state_db,flow,settings.official_snapshot_dir))
+                    alerts.extend(dispatch_official(settings.official_state_db,flow,settings.official_snapshot_dir,
+                                                   allotment_handler=grey.retain_notice if grey else None))
                     if settings.research_root:
                         alerts.extend(schedule_ready_offers(settings.official_state_db,settings.research_root,reminders,datetime.now(timezone.utc)))
                 alerts.extend(NoticeBridge(flow,reminders).send_due())
@@ -108,7 +116,9 @@ class MobileService:
                 for raw,eid in unsent:
                     if not settings.acceptance_mode or eid in settings.accepted_event_ids:
                         flow.send_receipt(raw,authorized=True)
-            return {'status':'ok','incoming':incoming,'reminders':alerts,'drafts':drafts,'delivery_enabled':settings.enable_deliveries}
+            result={'status':'ok','incoming':incoming,'reminders':alerts,'drafts':drafts,'delivery_enabled':settings.enable_deliveries}
+            if grey_result is not None:result['grey_analysis']=grey_result
+            return result
 
     def run_loop(self,stop,max_cycles=None):
         cycles=0;last=None

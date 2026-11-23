@@ -10,7 +10,7 @@ def absolutize(value):
         return str(ROOT/value)
     return value
 
-for name in ('local','service','publisher','mobile'):
+for name in ('local','service','publisher','mobile','grey'):
     target=ROOT/'config'/f'{name}.json'
     target.parent.mkdir(exist_ok=True,mode=0o700)
     if not target.exists():

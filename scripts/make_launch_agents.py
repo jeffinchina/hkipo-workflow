@@ -17,6 +17,7 @@ env['PATH']=os.environ.get('PATH',os.defpath)
 commands={
     'scan':['watch','--config',str(ROOT/'config/service.json'),'--classify'],
     'publisher':['publisher','--config',str(ROOT/'config/publisher.json'),'--watch'],
+    'grey':['grey-service','--config',str(ROOT/'config/grey.json'),'--watch'],
     'mobile':['mobile-service','--config',str(ROOT/'config/mobile.json'),'--watch'],
 }
 if args.enable_writer:commands['scan']+=['--work','--enable-writer']
@@ -28,4 +29,4 @@ for name,command in commands.items():
            'StandardOutPath':str(out/(name+'.log')),'StandardErrorPath':str(out/(name+'.error.log'))}
     target=out/(label+'.plist')
     target.write_bytes(plistlib.dumps(value));target.chmod(0o600)
-print('Generated three local LaunchAgents. Review them before installing with launchctl.')
+print('Generated four local LaunchAgents. Review them before installing with launchctl.')

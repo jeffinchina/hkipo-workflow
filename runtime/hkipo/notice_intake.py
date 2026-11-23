@@ -21,7 +21,7 @@ def _live(db):
     return [json.loads(r['payload']) for r in db.execute('SELECT payload FROM events WHERE baseline=0')]
 
 
-def dispatch_official(store_state_db, flow, snapshot_dir=None):
+def dispatch_official(store_state_db, flow, snapshot_dir=None, *, allotment_handler=None):
     evidence = []
     if snapshot_dir:
         from .service import SnapshotArchive
@@ -46,7 +46,13 @@ def dispatch_official(store_state_db, flow, snapshot_dir=None):
         except (KeyError, ValueError, TypeError):
             results.append(dict(event_id=d.get('event_id'),status='skipped_unassociated'))
             continue
-        result = bridge.send_notice(event, d['event_id'], '【官方公告】' + d['title'], event['brief'] + '\n' + event['source_url'])
+        if d['kind']=='allotment':
+            # The source event stays allotment. Its facts feed the fixed-time
+            # grey-market analysis; no duplicate immediate allotment e-mail.
+            result=(allotment_handler(event,d) if allotment_handler else
+                    {'status':'retained_for_grey_analysis'})
+        else:
+            result = bridge.send_notice(event, d['event_id'], '【官方公告】' + d['title'], event['brief'] + '\n' + event['source_url'])
         results.append(dict(result,source_event_id=d['event_id']))
     return results
 

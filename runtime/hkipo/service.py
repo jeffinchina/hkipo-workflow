@@ -156,7 +156,8 @@ class ServiceSettings:
     skill_paths: dict = field(default_factory=dict)
     writer_options: dict = field(default_factory=dict)
     author_inputs: dict = field(default_factory=dict)
-    auto_article_kinds: tuple = ('offer',)
+    auto_article_kinds: tuple = ('offer','allotment')
+    grey_state_db: str|None = None
     def __post_init__(self):
         if self.scan_seconds<1 or self.aggregate_seconds<1 or self.overlap_hours<0 or self.initial_days<1:raise ValueError('Invalid service timing')
         if not 1<=self.max_classification_groups<=100 or not 1<=self.max_worker_groups<=100:raise ValueError('Unbounded service batch')
@@ -194,6 +195,16 @@ class LocalService:
     def classify_cycle(self,now=None):
         now=now or _now();state=self._state('classification');evidence,errors=self.archive.evidence()
         all_events=self._events();active=[e for e,b in all_events if b in (0,2) and e['kind'] in {'offer','allotment','exception'}]
+        if self.settings.grey_state_db and Path(self.settings.grey_state_db).is_file():
+            # A current/future broker session may belong to an offer present at
+            # startup. Confirm its IPO episode from complete official covers,
+            # without promoting baseline documents or writing historical offers.
+            import sqlite3
+            with sqlite3.connect(self.settings.grey_state_db) as db:
+                current={code for code,day,status in db.execute("SELECT json_extract(payload,'$.stock_code'),trade_date,delivery_status FROM grey_sessions")
+                         if status not in ('skipped_history','superseded') and -7<=(datetime.fromisoformat(day).date()-now.date()).days<=60}
+            existing={e['event_id'] for e in active}
+            active += [e for e,b in all_events if b==1 and e['kind']=='offer' and e['stock_code'] in current and e['event_id'] not in existing]
         # Only actual official role-linked candidates are downloaded. Preliminary,
         # routine listings and random title keywords never spend model budget.
         official_urls={x.url for x in evidence}
@@ -211,7 +222,13 @@ class LocalService:
         for key,events in sorted(groups.items()):
             code,language,kind,dates=key
             material=[e for e,_ in all_events if e['stock_code']==code and e['language']==language and e['kind']==kind and any(x.url==e['url'] and x.public_date in dates for x in evidence)]
-            identity=_hash(json.dumps({'ids':sorted(e['event_id'] for e in material),'evidence':sorted({(x.url,x.role,x.public_date,x.stock_code,x.locator) for x in evidence if x.url in {e['url'] for e in material}}), 'classifier_rules':1},sort_keys=True).encode())
+            prior_context=[]
+            if kind!='offer':
+                for file in (self.root/'classification').glob('*.json'):
+                    prior=json.loads(file.read_text())
+                    if prior.get('decision')=='confirmed' and prior.get('prospectus_public_date') and prior.get('stock_code')==code:
+                        prior_context.append((prior.get('episode_id'),prior.get('prospectus_public_date')))
+            identity=_hash(json.dumps({'ids':sorted(e['event_id'] for e in material),'evidence':sorted({(x.url,x.role,x.public_date,x.stock_code,x.locator) for x in evidence if x.url in {e['url'] for e in material}}), 'classifier_rules':4, 'prior_ipo_episodes':sorted(set(prior_context))},sort_keys=True).encode())
             # Already processed input is not repeatedly downloaded every minute.
             if identity in state['classification_inputs']:continue
             if any(state['download_failures'].get(e['event_id']) and now<datetime.fromisoformat(state['download_failures'][e['event_id']]['retry_at']) for e in material):continue

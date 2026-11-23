@@ -10,7 +10,7 @@ import re
 from .delivery import DEFAULT_RECIPIENT, DeliveryError, fingerprint
 from .models import canonical_url
 
-KINDS = {'allotment_writing', 'allotment_notice', 'exception_notice'}
+KINDS = {'allotment_writing', 'allotment_notice', 'exception_notice', 'grey_analysis'}
 
 
 def make_official_event(doc_event, episode_id=None, *, source_hash):

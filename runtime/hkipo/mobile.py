@@ -46,7 +46,7 @@ class MobileWorkflow:
         if not isinstance(event,dict) or any(k not in event or (k!='images' and not event[k]) for k in required):
             raise ValueError('Incomplete reviewed allotment event')
         kind=event.get('notification_kind')
-        if kind is not None and kind not in {'allotment_writing','allotment_notice','exception_notice'}:
+        if kind is not None and kind not in {'allotment_writing','allotment_notice','exception_notice','grey_analysis'}:
             raise ValueError('Unsupported notification kind')
         if (kind is None and event.get('source_reviewed') is not True) or not str(event['stock_code']).isdigit():
             raise ValueError('Source review and exact security identity required')
@@ -84,7 +84,7 @@ class MobileWorkflow:
         mid=f'<hkipo-reply-{key}@local.invalid>'
         msg=EmailMessage(policy=SMTP)
         msg['From']=sender;msg['To']=DEFAULT_RECIPIENT;msg['Reply-To']=sender
-        label='【流程验收·历史回放】' if event.get('replay') is True else {'allotment_writing':'【出签写作提醒】','allotment_notice':'【股份分配公告】','exception_notice':'【发行变动公告】'}.get(event.get('notification_kind'),'【出签资料】')
+        label='【流程验收·历史回放】' if event.get('replay') is True else {'allotment_writing':'【出签写作提醒】','allotment_notice':'【股份分配公告】','exception_notice':'【发行变动公告】','grey_analysis':'【暗盘分析】'}.get(event.get('notification_kind'),'【出签资料】')
         msg['Subject']=f"{label}{event['issuer']} {event['stock_code']}"
         msg['Message-ID']=mid
         text=(f"{event['issuer']}（{event['stock_code']}）\n\n{event['brief']}\n\n"

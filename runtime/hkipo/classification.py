@@ -90,8 +90,8 @@ def inspect_cover(path,expected_code):
     if exclude:result['reasons'].append('excluded_cover_type:'+exclude[0]);return result
     codes=[]
     for i,text in enumerate(pages,1):
-        for match in re.finditer(r'(?:股份代號|股份代号|Stock\s+Code)\s*[:：]?\s*(\d{1,5})(?!\d)',text,re.I):
-            codes.append(match[1].zfill(5));result['evidence'].append({'rule':'labelled_stock_code','pdf_page':i,'quote':match[0]})
+        for match in re.finditer(r'(?:股份代號|股份代号|Stock\s+Code)\s*[:：]?\s*(\d(?:[ \t\u00a0]*\d){0,4})(?![ \t\u00a0]*\d)',text,re.I):
+            codes.append(re.sub(r'\s+','',match[1]).zfill(5));result['evidence'].append({'rule':'labelled_stock_code','pdf_page':i,'quote':match[0]})
     if set(codes)!={str(expected_code).zfill(5)}:result['reasons'].append('cover_code_missing_or_mismatch');return result
     issuers=[]
     for i,text in enumerate(pages,1):
@@ -116,7 +116,7 @@ def inspect_cover(path,expected_code):
     publication_dates=[]
     for index,text in enumerate(pages,1):
         for line in text.splitlines():
-            match=re.fullmatch(r'\s*(20\d{2})年(\d{1,2})月(\d{1,2})日\s*',line)
+            match=re.fullmatch(r'\s*(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*',line)
             if match:
                 publication_dates.append(f'{match[1]}-{int(match[2]):02d}-{int(match[3]):02d}')
                 result['evidence'].append({'rule':'standalone_publication_date','pdf_page':index,'quote':line})

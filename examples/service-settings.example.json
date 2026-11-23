@@ -21,5 +21,10 @@
     "visual_effort": "low",
     "visual_max_batches": 100
   },
-  "author_inputs": {}
+  "author_inputs": {},
+  "auto_article_kinds": [
+    "offer",
+    "allotment"
+  ],
+  "grey_state_db": "data/grey/grey.sqlite3"
 }

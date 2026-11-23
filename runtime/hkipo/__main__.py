@@ -112,8 +112,18 @@ def main(argv=None):
     pub.add_argument('--config',required=True)
     pub.add_argument('--watch',action='store_true')
     pub.add_argument('--max-cycles',type=_positive_int)
+    grey=commands.add_parser('grey-service',help='暗盘收盘资料与18:40邮件；独立于配发公告')
+    grey.add_argument('--config',required=True)
+    grey.add_argument('--watch',action='store_true')
+    grey.add_argument('--max-cycles',type=_positive_int)
     args = parser.parse_args(argv)
-    if args.command == 'publisher':
+    if args.command=='grey-service':
+        from .grey_service import GreySettings,configured_service
+        try:settings=GreySettings(**json.loads(Path(args.config).read_text()))
+        except (OSError,ValueError,TypeError):parser.error('需要有效的GreySettings本地JSON配置')
+        instance=configured_service(settings)
+        result=_watch(instance,args.max_cycles,None) if args.watch else instance.cycle()
+    elif args.command == 'publisher':
         from .publisher import Publisher,PublisherSettings
         try:
             settings=PublisherSettings(**json.loads(Path(args.config).read_text()))
