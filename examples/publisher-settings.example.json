@@ -1,0 +1,14 @@
+{
+  "data_dir": "data/publisher",
+  "state_db": "data/service/state.sqlite3",
+  "research_root": "data/service/research",
+  "private_config": "private/config.json",
+  "settings_path": "config/local.json",
+  "enable_deliveries": false,
+  "production_accepted": false,
+  "acceptance_mode": false,
+  "accepted_event_ids": [],
+  "thumb_media_id": null,
+  "poll_seconds": 60,
+  "max_jobs": 2
+}

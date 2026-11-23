@@ -1,0 +1,14 @@
+{
+  "provenance": "Unmodified row from locally retained legacy HKEX aggregate snapshot; not a preserved original HTML response",
+  "snapshot_path": "/optional-fixtures/data/2026-05-08.json",
+  "snapshot_sha256": "64eda781f9c7aa4879d676db595f971d95f32d6811de6f75941e649435682949",
+  "date": "2026-05-08",
+  "source_label": "www2(繁)",
+  "stock": {
+    "code": "6871",
+    "name": "浙江翼菲智能科技股份有限公司",
+    "announcement": "https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0508/2026050800002_c.pdf",
+    "prospectus": "https://www1.hkexnews.hk/listedco/listconews/sehk/2026/0508/2026050800016_c.pdf",
+    "allotment": null
+  }
+}

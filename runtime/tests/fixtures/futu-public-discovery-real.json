@@ -1,0 +1,51 @@
+{
+  "schema_version": 1,
+  "source": "futu_public_12147652",
+  "entry": "https://q.futunn.com/profile/12147652",
+  "status": "success",
+  "started_at": "2026-11-20T22:50:25.865Z",
+  "finished_at": "2026-11-20T22:50:34Z",
+  "posts": [
+    {
+      "feed_id": "117647855976452",
+      "url": "https://q.futunn.com/feed/117647855976452",
+      "author_id": "12147652",
+      "published_timestamp": 1795163818,
+      "title": "中签公布 | 先通医药-B IPO 富途证券客户获配情况出炉！",
+      "body": "牛友们好呀！ $先通医药-B (09941.HK)$ 已经公布中签，牛牛新股君统计了富途客户获配情况，牛友们快来查收[打call][打call] 先通医药-B富途客户获配情况如下： 预告：先通医药-B将于11月23日16:15-18:30进行暗盘交易，11月24日正式上市。 抽新股用富途，0利息、0手续费、0现金认购。现参与活动有机会免1年抽新股费用，[链接: 快来体验吧>>]",
+      "images": [
+        "https://nnqimage.futunn.com/sns_client_feed/12147652/20261120/web-1795163793272-sBdvk985PZ.png?area=999&is_public=true",
+        "https://nnqimage.futunn.com/sns_client_feed/12147652/20261120/web-1795163793272-sBdvk985PZ.png/big?area=999&is_public=true"
+      ],
+      "data_scope": "broker_customer_allotment"
+    },
+    {
+      "feed_id": "117601079198100",
+      "url": "https://q.futunn.com/feed/117601079198100",
+      "author_id": "12147652",
+      "published_timestamp": 1794450061,
+      "title": "中签公布 | 国星宇航IPO 富途证券客户获配情况出炉！",
+      "body": "牛友们好呀！ $国星宇航 (06935.HK)$ 已经公布中签，牛牛新股君统计了富途客户获配情况，牛友们快来查收[打call][打call] 国星宇航富途客户获配情况如下： 预告：国星宇航将于11月12日16:15-18:30进行暗盘交易，11月13日正式上市。 抽新股用富途，0利息、0手续费、0现金认购。现参与活动有机会免1年抽新股费用，[链接: 快来体验吧>>]",
+      "images": [
+        "https://nnqimage.futunn.com/sns_client_feed/12147652/20261112/web-1794449950793-UFTwLyeupx.png?area=999&is_public=true",
+        "https://nnqimage.futunn.com/sns_client_feed/12147652/20261112/web-1794449950793-UFTwLyeupx.png/big?area=999&is_public=true"
+      ],
+      "data_scope": "broker_customer_allotment"
+    },
+    {
+      "feed_id": "117591038296068",
+      "url": "https://q.futunn.com/feed/117591038296068",
+      "author_id": "12147652",
+      "published_timestamp": 1794296849,
+      "title": "中签公布 | 一微科技、宏芯宇IPO 富途证券客户获配情况出炉！",
+      "body": "牛友们好呀！ $一微科技 (02065.HK)$$宏芯宇 (02681.HK)$ 已经公布中签，牛牛新股君统计了富途客户获配情况，牛友们快来查收[打call][打call] 一微科技富途客户获配情况如下： 宏芯宇富途客户获配情况如下： 预告：以上两只新股将于11月11日16:15-18:30进行暗盘交易，11月12日正式上市。 $国星宇航 (06935.HK)$ 认购结束，将于11月11日公布中签。 抽新股用富途，0利息、0手续费、0现金认购。现参与活动有机会免1年抽新股费用，[链接: 快来体验吧>>]",
+      "images": [
+        "https://nnqimage.futunn.com/sns_client_feed/12147652/20261110/web-1794296831964-fri6jZzUBU.png?area=999&is_public=true",
+        "https://nnqimage.futunn.com/sns_client_feed/12147652/20261110/web-1794296831964-fri6jZzUBU.png/big?area=999&is_public=true",
+        "https://nnqimage.futunn.com/sns_client_feed/12147652/20261110/web-1794296843389-TiTXEfEsMH.png?area=999&is_public=true",
+        "https://nnqimage.futunn.com/sns_client_feed/12147652/20261110/web-1794296843389-TiTXEfEsMH.png/big?area=999&is_public=true"
+      ],
+      "data_scope": "broker_customer_allotment"
+    }
+  ]
+}

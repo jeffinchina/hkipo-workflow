@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "style": {
+    "title_color": "000000",
+    "heading_color": "2B77BF",
+    "body_color": "rgba(0,0,0,0.9)",
+    "cta_color": "rgba(0,0,0,0.9)",
+    "risk_color": "2B77BF",
+    "font_size_px": 16,
+    "line_height_px": 32,
+    "paragraph_space_px": 24,
+    "heading_space_px": 12,
+    "side_padding_px": 0,
+    "text_align": "left",
+    "body_font_weight": 300,
+    "heading_font_weight": 400,
+    "field_label_font_weight": 400,
+    "cta_highlight_color": "FFA900",
+    "cta_highlight_phrases": [
+      "点个赞",
+      "点个关注"
+    ],
+    "qr_margin_px": 17,
+    "numbered_items": true
+  },
+  "author": "",
+  "need_open_comment": 1,
+  "only_fans_can_comment": 0,
+  "thumb_media_id": null
+}

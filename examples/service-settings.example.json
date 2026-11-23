@@ -1,0 +1,25 @@
+{
+  "data_dir": "data/service",
+  "scan_seconds": 60,
+  "overlap_hours": 0.25,
+  "initial_days": 3,
+  "aggregate_seconds": 900,
+  "max_classification_groups": 10,
+  "max_worker_groups": 2,
+  "enable_writer": false,
+  "include_gem": false,
+  "allow_legacy_replay": false,
+  "skill_paths": {
+    "offer": "skills/hkipo-editor",
+    "allotment": "skills/hkipo-editor",
+    "exception": "skills/hkipo-editor"
+  },
+  "writer_options": {
+    "settings_path": "config/local.json",
+    "source_mode": "text_first",
+    "auto_visual_review": false,
+    "visual_effort": "low",
+    "visual_max_batches": 100
+  },
+  "author_inputs": {}
+}

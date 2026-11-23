@@ -1,0 +1,41 @@
+# Credentials and local configuration
+.env
+.env.*
+!.env.example
+config/
+private/
+assets/branding/
+**/*settings.json
+**/*config.json
+**/draft-profile.json
+# State, research, drafts and deliveries
+运行数据/
+research/
+evaluation/
+/data/
+artifacts/
+logs/
+*.sqlite*
+*.db
+*.db-*
+*.eml
+*.log
+*.jsonl
+*.pdf
+*.docx
+*.zip
+*.pem
+*.key
+*.p12
+*.pfx
+# Dependencies and caches
+.venv/
+venv/
+vendor/
+node_modules/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.DS_Store

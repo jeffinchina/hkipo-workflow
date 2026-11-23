@@ -1,0 +1,33 @@
+{
+  "year": 2026,
+  "verified": true,
+  "timezone": "Asia/Hong_Kong",
+  "source_url": "https://www.info.gov.hk/gia/general/202505/16/P2025051300353.htm",
+  "published_date": "2025-05-16",
+  "verified_at": "2026-11-21",
+  "verification_method": "Official HKSAR Government press release read via web open; dates transcribed from complete general-holiday table, not statutory-holiday list.",
+  "weekends": [
+    5,
+    6
+  ],
+  "holidays": [
+    "2026-01-01",
+    "2026-02-17",
+    "2026-02-18",
+    "2026-02-19",
+    "2026-04-03",
+    "2026-04-04",
+    "2026-04-06",
+    "2026-04-07",
+    "2026-05-01",
+    "2026-05-25",
+    "2026-06-19",
+    "2026-07-01",
+    "2026-09-26",
+    "2026-10-01",
+    "2026-10-19",
+    "2026-12-25",
+    "2026-12-26"
+  ],
+  "normalized_dates_sha256": "8efcdac0b5bbbf6c7712e1b98240d8881134c8d5a7e2af3345688f450771bed2"
+}

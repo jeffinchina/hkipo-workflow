@@ -1,0 +1,9 @@
+{
+  "name": "hkipo-layout-tools",
+  "private": true,
+  "type": "module",
+  "description": "Optional browser tools for local layout QA and public broker sources",
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

@@ -1,0 +1,15 @@
+{
+  "data_dir": "data/mobile",
+  "private_config": "private/config.json",
+  "template_approval": "private/approved-template.json",
+  "enable_deliveries": false,
+  "acceptance_mode": false,
+  "accepted_event_ids": [],
+  "thumb_media_id": null,
+  "table_cover_authorized": false,
+  "scan_seconds": 60,
+  "max_drafts": 3,
+  "official_state_db": "data/service/state.sqlite3",
+  "official_snapshot_dir": "data/service/snapshots",
+  "research_root": "data/service/research"
+}
