@@ -4,6 +4,7 @@ from email import policy
 from email.parser import BytesParser
 from pathlib import Path
 import tempfile
+from datetime import datetime,timezone,timedelta
 import unittest
 from hkipo.mail_reply import MailReplyStore
 from hkipo.mail_transport import poll_replies, IntakeError
@@ -21,9 +22,9 @@ def message(mid='<reply@example.test>',thread=REMINDER,body='作者原文',sende
 
 
 class FakeIMAP:
-    def __init__(self,inbox=None,sent=None,sizes=None):
+    def __init__(self,inbox=None,sent=None,sizes=None,dates=None):
         self.messages={'INBOX':inbox or {},'Sent Messages':sent or {}}
-        self.sizes=sizes or {};self.calls=[];self.folder=None;self.logged_out=False
+        self.sizes=sizes or {};self.dates=dates or {};self.calls=[];self.folder=None;self.logged_out=False
     def login(self,*args):self.calls.append(('login',));return 'OK',[]
     def select(self,folder,readonly=False):
         assert readonly is True
@@ -39,7 +40,11 @@ class FakeIMAP:
             msg=BytesParser(policy=policy.default).parsebytes(raw)
             head=''.join(f'{key}: {msg[key]}\r\n' for key in ('From','To','Reply-To','Subject','Message-ID','In-Reply-To','References') if msg[key])+'\r\n'
             size=self.sizes.get((self.folder,uid),len(raw))
-            return 'OK',[(f'1 (RFC822.SIZE {size} BODY[HEADER.FIELDS]'.encode(),head.encode()),b')']
+            internal=''
+            if 'INTERNALDATE' in fields:
+                stamp=self.dates.get((self.folder,uid),datetime.now(timezone.utc).strftime('%d-%b-%Y %H:%M:%S %z'))
+                internal=' INTERNALDATE "'+stamp+'"'
+            return 'OK',[(f'1 (RFC822.SIZE {size}{internal} BODY[HEADER.FIELDS]'.encode(),head.encode()),b')']
         assert fields=='(BODY.PEEK[])'
         return 'OK',[(b'1 (BODY[]',raw),b')']
     def body_calls(self,folder=None):
@@ -214,3 +219,72 @@ class MailTransportTests(unittest.TestCase):
         self.assertEqual(client.body_calls('Sent Messages')[0][2],b'100')
         with self.store.connect() as c:
             self.assertEqual(c.execute('SELECT event_id FROM reply_reminders WHERE message_id=?',('<rewritten@example.test>',)).fetchone()[0],'event-1')
+
+
+class EmptyUnicodeSubjectIMAP(FakeIMAP):
+    """Real server failure: UTF-8 subject SEARCH succeeds but returns nothing."""
+    def uid(self,command,*args):
+        if command=='SEARCH' and self.folder=='Sent Messages' and ('Subject' in args or 'BEFORE' in args or 'Message-ID' in args):
+            self.calls.append((command,self.folder,*args));return 'OK',[b'']
+        return super().uid(command,*args)
+
+
+class UnicodeSubjectRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp=tempfile.TemporaryDirectory();self.addCleanup(self.temp.cleanup)
+        self.store=MailReplyStore(Path(self.temp.name)/'state.db',[SENDER])
+        self.store.register_reminder(REMINDER,'event-1')
+        self.config={'user':SENDER,'password':'synthetic-secret'}
+        self.original=MailTransportTests.original(self)
+        self.store.remember_reminder(self.original.as_bytes(),'event-1')
+        self.original.replace_header('Message-ID','<rewritten-root@example.test>')
+        self.reply=message(thread='<rewritten-root@example.test>')
+
+    def poll(self,client):return poll_replies(self.store,self.config,client_factory=lambda:client)
+
+    def test_empty_subject_search_falls_back_to_bounded_own_sent_headers(self):
+        unrelated=message(mid='<unrelated@example.test>')
+        client=EmptyUnicodeSubjectIMAP({b'1':self.reply},{b'2':self.original.as_bytes(),b'3':self.reply,b'4':unrelated})
+        result=self.poll(client)
+        self.assertEqual(result['results'][0]['status'],'pending')
+        searches=[c for c in client.calls if c[0]=='SEARCH' and c[1]=='Sent Messages' and 'FROM' in c]
+        self.assertTrue(searches);self.assertIn('SINCE',searches[0]);self.assertNotIn('BEFORE',searches[0])
+        self.assertTrue(any('INTERNALDATE' in c[-1] for c in client.calls if c[0]=='FETCH'))
+        self.assertNotIn(b'4',[c[2] for c in client.body_calls('Sent Messages')])
+        self.assertEqual(self.store.pending()[0]['body'],'作者原文')
+
+    def test_fallback_does_not_accept_matching_subject_with_changed_body(self):
+        self.original.get_payload()[0].get_payload()[1].set_content('<p>changed</p>',subtype='html')
+        client=EmptyUnicodeSubjectIMAP({b'1':self.reply},{b'2':self.original.as_bytes(),b'3':self.reply})
+        self.poll(client)
+        self.assertEqual(self.store.pending(),[])
+        self.assertEqual(client.body_calls('INBOX'),[])
+
+    def test_fallback_keeps_header_budget_and_refuses_duplicate_reminders(self):
+        for count in (11,101):
+            client=EmptyUnicodeSubjectIMAP({b'1':self.reply},{str(i).encode():self.original.as_bytes() for i in range(count)})
+            self.poll(client)
+            self.assertEqual(client.body_calls(),[])
+            self.assertEqual(self.store.pending(),[])
+
+    def test_our_registered_status_root_is_not_ingested_as_an_author_reply(self):
+        # A status receipt is an outbound root and can itself carry References.
+        raw=message(mid=REMINDER)
+        client=FakeIMAP({b'1':raw},{b'2':raw})
+        self.poll(client)
+        self.assertEqual(self.store.pending(),[])
+        self.assertEqual(client.body_calls(),[])
+
+    def test_fallback_checks_server_internal_date_before_reading_a_body(self):
+        for stamp in ('01-Jan-2001 00:00:00 +0000',(datetime.now(timezone.utc)+timedelta(days=6)).strftime('%d-%b-%Y %H:%M:%S %z'),'invalid-date'):
+            client=EmptyUnicodeSubjectIMAP({b'1':self.reply},{b'2':self.original.as_bytes()},dates={('Sent Messages',b'2'):stamp})
+            self.poll(client)
+            self.assertEqual(client.body_calls(),[])
+            self.assertEqual(self.store.pending(),[])
+
+    def test_empty_message_id_search_cannot_replace_exact_sent_body_proof(self):
+        changed=message(thread='<rewritten-root@example.test>',body='different author body')
+        client=EmptyUnicodeSubjectIMAP({b'1':self.reply},{b'2':self.original.as_bytes(),b'3':changed})
+        result=self.poll(client)
+        self.assertEqual(result['results'][0]['status'],'deferred')
+        self.assertEqual(self.store.pending(),[])

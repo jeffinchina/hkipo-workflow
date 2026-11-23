@@ -6,9 +6,9 @@ No new mail is sent, no flag is changed, and no mailbox-wide body scan occurs.
 """
 from email import policy
 from email.parser import BytesParser
-from email.utils import getaddresses
+from email.utils import getaddresses, parsedate_to_datetime
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import imaplib
 import re
 import ssl
@@ -57,8 +57,9 @@ def _thread_ids(msg):
     return set(_IDS.findall(' '.join(str(v) for h in ('In-Reply-To','References') for v in msg.get_all(h, []))))
 
 
-def _headers(client, uid, max_bytes):
-    status, data = client.uid('FETCH', uid, '(RFC822.SIZE BODY.PEEK[HEADER.FIELDS (FROM TO REPLY-TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES)])')
+def _headers(client, uid, max_bytes, *, date_window=None):
+    fields='(RFC822.SIZE '+('INTERNALDATE ' if date_window else '')+'BODY.PEEK[HEADER.FIELDS (FROM TO REPLY-TO SUBJECT DATE MESSAGE-ID IN-REPLY-TO REFERENCES)])'
+    status, data = client.uid('FETCH', uid, fields)
     if status != 'OK': raise IntakeError('imap_header_fetch_failed')
     parts = [r for r in data or [] if isinstance(r, tuple)]
     if len(parts) != 1 or len(parts[0]) != 2 or not all(isinstance(v, bytes) for v in parts[0]):
@@ -66,6 +67,11 @@ def _headers(client, uid, max_bytes):
     match = re.search(rb'RFC822.SIZE\s+(\d+)', parts[0][0], re.I)
     if not match or int(match[1]) > max_bytes or len(parts[0][1]) > min(max_bytes, 65536):
         return None
+    if date_window:
+        value=re.search(rb'INTERNALDATE\s+"([^"]+)"',parts[0][0],re.I)
+        try:day=datetime.strptime(value[1].decode('ascii'),'%d-%b-%Y %H:%M:%S %z').date()
+        except (ValueError,UnicodeError,TypeError):return None
+        if not date_window[0]<=day<date_window[1]:return None
     return BytesParser(policy=policy.default).parsebytes(parts[0][1])
 
 
@@ -82,10 +88,19 @@ def _proof(client, raw, sender, sent_folder, max_bytes):
         expected = None
     _select(client, sent_folder)
     ids = _search(client, 'HEADER', 'Message-ID', _quoted(str(mids[0]).strip()))
+    date_window=None
+    if not ids:
+        # A server may silently fail even an exact Message-ID search. Bound
+        # same-account Sent headers by server date, then require exact ID,
+        # thread, complete author text and attachments as in the fast path.
+        try:day=parsedate_to_datetime(str(msg.get('Date',''))).date()
+        except (ValueError,TypeError,AttributeError):day=datetime.now(timezone.utc).date()
+        date_window=(day-timedelta(days=1),day+timedelta(days=3))
+        ids=_search(client,'SINCE',date_window[0].strftime('%d-%b-%Y'),'FROM',_quoted(sender))
     if len(ids) > 100: return False
     exact = []
     for uid in ids:
-        head = _headers(client, uid, max_bytes)
+        head = _headers(client, uid, max_bytes,date_window=date_window)
         if head is not None and len(head.get_all('Message-ID', [])) == 1 and str(head['Message-ID']).strip() == str(mids[0]).strip():
             exact.append((uid, head))
     if len(exact) != 1: return False
@@ -172,14 +187,24 @@ def _reconcile_reminder_aliases(client, store, sender, sent_folder, limit):
         _select(client, sent_folder)
         # Restrict to this account's Sent and a short delivery window. A search
         # server may overmatch; exact headers gate every bounded body fetch.
-        ids = _search(client, 'SINCE', (day-timedelta(days=1)).strftime('%d-%b-%Y'),
-                      'BEFORE', (day+timedelta(days=3)).strftime('%d-%b-%Y'),
+        since=(day-timedelta(days=1)).strftime('%d-%b-%Y')
+        before=(day+timedelta(days=3)).strftime('%d-%b-%Y')
+        ids = _search(client, 'SINCE', since, 'BEFORE', before,
                       'HEADER', 'Subject', _quoted(subject).encode('utf-8'), charset='UTF-8')
+        fallback=not ids
+        if fallback:
+            # Some IMAP servers return an empty successful result for a UTF-8
+            # subject that is visibly present. Use only this account's Sent
+            # headers in the same short window, then require the exact headers
+            # and complete original MIME below before accepting any alias.
+            # The same servers can also silently fail BEFORE. Enforce its
+            # upper bound using server INTERNALDATE before any body fetch.
+            ids=_search(client,'SINCE',since,'FROM',_quoted(sender))
         if len(ids) > 100:
             continue
         candidates = []
         for uid in ids:
-            head = _headers(client, uid, store.max_bytes)
+            head = _headers(client, uid, store.max_bytes,date_window=((day-timedelta(days=1)).date(),(day+timedelta(days=3)).date()) if fallback else None)
             if head is None or not _same_reminder_headers(original, head, sender):
                 continue
             mids = head.get_all('Message-ID', [])
@@ -256,6 +281,9 @@ def poll_replies(store, config, *, sent_folder='Sent Messages', client_factory=N
             if len(head.get_all('Message-ID', [])) != 1: continue
             mid = str(head['Message-ID']).strip()
             if not _IDS.fullmatch(mid): continue
+            # Registered originals/verified aliases are our outbound roots,
+            # never a new author reply even if a status receipt has References.
+            if mid in reminders: continue
             # IMAP HEADER SEARCH is a substring search. Validate exact registered
             # identities before downloading any author's private body.
             if not _thread_ids(head).intersection(reminders): continue
