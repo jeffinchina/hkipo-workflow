@@ -50,6 +50,35 @@ class RevisionTests(unittest.TestCase):
         self.assertEqual(history[-1]['remaining'],0)
         self.assertTrue(history[-1]['resolved'])
 
+    def test_incomplete_author_coverage_gets_uncited_pages_in_revision(self):
+        partial = copy.deepcopy(self.bundle)
+        partial['sources_seen'][0]['pages_reviewed'] = [1]
+        drafts = []
+
+        def fake(prompt, schema, outdir, name, *args, **kwargs):
+            path = Path(outdir)
+            path.mkdir(parents=True, exist_ok=True)
+            if name == 'draft':
+                drafts.append(prompt)
+                value = partial if len(drafts) == 1 else self.bundle
+            else:
+                self.assertEqual(name, 'review')
+                value = self.review
+            (path / (name + '.json')).write_text(json.dumps(value))
+            (path / (name + '.completion.json')).write_text('{"success":true}')
+            return copy.deepcopy(value)
+
+        with patch('hkipo.writer.load_skill', return_value='fixed specification'), \
+             patch('hkipo.writer.run_codex', side_effect=fake):
+            result = write_article({'kind': 'offer', 'event_id': 'offline-test'},
+                                   [self.source], self.root/'job', self.root,
+                                   include_docx=False, max_revisions=1)
+        self.assertEqual(result['status'], 'ready_for_delivery')
+        self.assertEqual(len(drafts), 2)
+        self.assertIn('Page two allocation data 200', drafts[1])
+        incompletely_read = json.loads(next((self.root/'job').glob('*/attempt-1/draft.json')).read_text())
+        self.assertEqual(incompletely_read['sources_seen'][0]['pages_reviewed'], [1])
+
     def test_resume_skips_complete_draft_and_researches_uncited_pages(self):
         calls=[]; bad=copy.deepcopy(self.review)
         bad.update(decision='needs_source',issues=[{'severity':'blocking','fact_id':'business',

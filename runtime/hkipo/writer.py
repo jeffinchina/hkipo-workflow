@@ -329,12 +329,30 @@ def _write_article(event, pdf_paths, job_dir, skill_path, author_inputs=None,
             stage = run_dir / f"attempt-{attempt + 1}"
             revision_source = source_section
             if attempt and source_mode == "text_first":
+                coverage_failed = any(issue.startswith('sources_seen:') for issue in quality['blocking'])
                 refs = [r for f in bundle.get("facts", []) for r in f.get("evidence", [])]
                 refs += [r for issue in review.get("issues", []) for r in issue.get("source_refs", [])]
                 refs += [r for f in (findings or {}).get('findings', []) for r in f.get('evidence', [])]
                 selected = {(r["document_id"], r["pdf_page"]) for r in refs}
                 excerpts = {"documents": [dict(d, pages=[p for p in d["pages"] if (d["document_id"], p["pdf_page"]) in selected]) for d in manifest["documents"]]}
-                revision_source = "\n原文未变，复用首轮完整提取缓存。以下是稿件及复核引用页原文；仅有据定向修订，保留未变事实和全文覆盖记录：\n" + documents_context(excerpts, visual)
+                if coverage_failed:
+                    # A revision given only excerpts cannot fix its own missing
+                    # coverage. Give it the complete source without rewriting
+                    # or substituting either model's attestation.
+                    revision_source = (
+                        "\n上一稿的作者来源覆盖未通过。请核对下方重新提供的全部逐页原文，"
+                        "按本轮实际阅读填写 sources_seen，保留已核实的事实与成稿。"
+                        "删除已经解决或不适用于本轮的阅读缺口及流程说明。"
+                        "独立复核另行运行，不能代填其结果。"
+                        + source_section
+                    )
+                else:
+                    revision_source = (
+                        "\n以下是稿件及复核引用页原文。仅定向修订，保留未变事实。"
+                        "sources_seen 是同一稿件的累计阅读范围，沿用此前确证的同版本覆盖，"
+                        "不要把它写成本轮从头通读，也不要仅按本轮节选缩减完整的稿件覆盖。"
+                        "\n" + documents_context(excerpts, visual)
+                    )
                 revision_source += "\n待修订上一稿：\n" + json.dumps(bundle, ensure_ascii=False)
             prompt = COMMON + context + "\n请先建立事实账本，再写可读文章。" + feedback + revision_source
             bundle = run_codex(prompt, ARTICLE_SCHEMA, stage, "draft", model, effort, settings_path=settings_path)

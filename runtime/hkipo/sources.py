@@ -158,13 +158,22 @@ class AggregateSource:
             except ValueError:continue
         raise SourceError('aggregate primary and language fallback exhausted')
 
+def title_row_exclusion(row):
+    """Identify known non-IPO rows with genuinely absent security fields."""
+    if row.get('STOCK_CODE') != '' or row.get('STOCK_NAME') != '':
+        return None
+    category = re.sub(r'\s+', '', unescape(str(row.get('LONG_TEXT', ''))))
+    if category == '債券及結構性產品-[上市通告-債務證券發行計劃]':
+        return 'non-IPO debt issuance programme notice'
+    if (category.startswith('債券及結構性產品-[') and '基礎上市文件' in category
+            and any(kind in category for kind in ('牛熊證', '衍生權證'))):
+        return 'non-IPO structured-product base listing document'
+    return None
+
+
 def title_row_excluded(row):
-    """Only documented non-equity listing categories with truly absent securities."""
-    category=re.sub(r'\s+','',unescape(str(row.get('LONG_TEXT',''))))
-    return (row.get('STOCK_CODE')=='' and row.get('STOCK_NAME')==''
-            and category.startswith('債券及結構性產品-[')
-            and '基礎上市文件' in category
-            and any(kind in category for kind in ('牛熊證','衍生權證')))
+    return title_row_exclusion(row) is not None
+
 
 def parse_title_json(raw,source='title-search',exclusions=None):
     try:
@@ -180,8 +189,9 @@ def parse_title_json(raw,source='title-search',exclusions=None):
             if not required.issubset(row):raise ValueError()
             url=canonical_url(urljoin('https://www1.hkexnews.hk',row['FILE_LINK']))
             published=datetime.strptime(row['DATE_TIME'],'%d/%m/%Y %H:%M').isoformat()+'+08:00'
-            if title_row_excluded(row):
-                excluded.append({'NEWS_ID':str(row['NEWS_ID']),'reason':'non-IPO structured-product base listing document'})
+            reason = title_row_exclusion(row)
+            if reason:
+                excluded.append({'NEWS_ID': str(row['NEWS_ID']), 'reason': reason})
                 continue
             codes=re.split(r'<br\s*/?>',str(row['STOCK_CODE']).strip(),flags=re.I)
             names=re.split(r'<br\s*/?>',str(row['STOCK_NAME']).strip(),flags=re.I)

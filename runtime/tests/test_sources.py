@@ -101,6 +101,24 @@ class TitleExclusionTests(unittest.TestCase):
         for x in exclusions:self.assertIn(x['NEWS_ID'],result.evidence)
         self.assertEqual(result.responses[0]['body'],self.raw)
 
+    def test_code_less_debt_programme_notice_does_not_block_complete_scan(self):
+        notice = dict(self.rows[0], NEWS_ID='123', STOCK_CODE='', STOCK_NAME='',
+                      LONG_TEXT='債券及結構性產品 - [上市通告 - 債務證券發行計劃]')
+        equity = dict(notice, NEWS_ID='456', STOCK_CODE='01234', STOCK_NAME='測試公司',
+                      LONG_TEXT='上市文件 - [發售以供認購]', TITLE='全球發售',
+                      FILE_LINK='/listedco/listconews/sehk/2026/1127/2026112700001_c.pdf')
+        data = dict(self.data, result=[notice, equity], recordCnt=2,
+                    loadedRecord=2, hasNextRow=False)
+        raw = json.dumps(data)
+        client = Mock()
+        client.get.return_value = raw
+        now = datetime(2026, 11, 27, tzinfo=timezone.utc)
+        result = TitleSearchSource(client).fetch(now, now)
+        self.assertEqual(result.count, 2)
+        self.assertEqual([e.stock_code for e in result.events], ['01234'])
+        self.assertIn('non-IPO debt issuance programme notice', result.evidence)
+        self.assertEqual([item.stock_code for item in title_evidence(raw)], ['01234'])
+
     def test_unknown_blank_and_one_sided_blank_remain_rejected(self):
         for change in ({'LONG_TEXT':'上市文件 - [發售以供認購]'},
                        {'STOCK_CODE':'01234'},{'STOCK_NAME':'issuer'},
