@@ -18,6 +18,18 @@ class RevisionTests(unittest.TestCase):
 
     def tearDown(self): self.tmp.cleanup()
 
+    def write_fixture(self, *args, **kwargs):
+        return write_article({'kind': 'offer', 'event_id': 'offline-test'}, [self.source],
+                             self.root / 'job', self.root, *args, include_docx=False, **kwargs)
+
+    @staticmethod
+    def save_model_output(outdir, name, value):
+        path = Path(outdir)
+        path.mkdir(parents=True, exist_ok=True)
+        (path / (name + '.json')).write_text(json.dumps(value))
+        (path / (name + '.completion.json')).write_text('{"success":true}')
+        return copy.deepcopy(value)
+
     def test_source_request_then_revision_then_pass_preserves_independent_review(self):
         calls=[]; drafts=[]; count=0
         bad=copy.deepcopy(self.review);bad.update(decision='needs_source',issues=[{
@@ -33,7 +45,8 @@ class RevisionTests(unittest.TestCase):
                 drafts.append(prompt);value=copy.deepcopy(self.bundle)
             elif name=='source-repair':
                 value={'findings':[{'fact_key':'business','finding':'Located full scope',
-                    'state':'located','evidence':[],'remaining_work':''}], 'summary':'research only'}
+                    'state':'located','evidence':[self.bundle['facts'][0]['evidence'][0]],
+                    'remaining_work':''}], 'summary':'research only'}
             else:
                 value=copy.deepcopy([bad,revision,self.review][min(count,2)]);count+=1
                 self.assertNotIn('上一轮未通过',prompt)
@@ -44,7 +57,8 @@ class RevisionTests(unittest.TestCase):
             result=write_article({'kind':'offer','event_id':'offline-test'},[self.source],self.root/'job',self.root,
                 include_docx=False,max_revisions=3)
         self.assertEqual(result['status'],'ready_for_delivery',result)
-        self.assertEqual([n for n,p in calls],['draft','review','source-repair','draft','review','draft','review'])
+        self.assertEqual([n for n,p in calls],['draft','review','source-repair','draft','review',
+                                            'source-repair','draft','review'])
         self.assertIn('保留上一稿已核实',drafts[1])
         history=json.loads(next((self.root/'job').glob('*/revision-history.json')).read_text())
         self.assertEqual(history[-1]['remaining'],0)
@@ -107,6 +121,84 @@ class RevisionTests(unittest.TestCase):
             'remaining_work':''}], 'summary':'invalid'}
         with self.assertRaises(ValueError):
             source_repair(self.docs,self.review,'',lambda *a,**kw:value,self.root/'probe')
+
+    def test_stalled_edits_exhaust_distinct_tactics_and_wait_for_official_evidence(self):
+        calls = []
+        bad = copy.deepcopy(self.review)
+        bad.update(decision='needs_source', issues=[{'severity': 'blocking', 'fact_id': 'offer_price',
+            'block_index': 0, 'problem': 'Need official final pricing notice', 'source_refs': []}])
+
+        def fake(prompt, schema, outdir, name, *args, **kwargs):
+            calls.append(name)
+            value = copy.deepcopy(self.bundle if name == 'draft' else bad)
+            if name == 'draft':
+                value['article']['title'] += ' ' + 'wording ' * len(calls)
+            elif name == 'source-repair':
+                value = {'findings': [], 'summary': 'Official pricing notice was not supplied'}
+            return self.save_model_output(outdir, name, value)
+
+        with patch('hkipo.writer.load_skill', return_value='fixed specification'), \
+             patch('hkipo.writer.run_codex', side_effect=fake):
+            first = self.write_fixture(max_revisions=1)
+            self.assertEqual(first['status'], 'revision_pending')
+            self.assertEqual(first['reason'], 'revision_recovery_pending')
+            self.assertEqual(first['retry_after_seconds'], 120)
+            second = self.write_fixture(max_revisions=1)
+            calls_after_tactics = calls[:]
+            final = self.write_fixture(max_revisions=1)
+        self.assertEqual(second['status'], 'needs_source')
+        self.assertEqual(second['reason'], 'authoritative_source_unresolved')
+        self.assertEqual(second['source_wait']['remaining_work'], ['Need official final pricing notice'])
+        self.assertEqual(second['source_wait']['documents'][0]['sha256'], self.docs['documents'][0]['sha256'])
+        self.assertIn('attempt-1', final['bundle_path'])
+        self.assertEqual(final['recovery'], {'best_attempt': 1, 'last_attempt': 4, 'remaining': 1, 'next_strategy': None})
+        self.assertEqual(calls, calls_after_tactics)
+        self.assertEqual(calls.count('review'), 4)
+        history = json.loads(Path(second['history_path']).read_text())
+        self.assertEqual([row['strategy'] for row in history], ['initial', 'targeted', 'evidence_reconciliation', 'verified_scope'])
+        self.assertEqual(len({row['bundle_sha256'] for row in history}), 4)
+        self.assertTrue(all(not row['improved'] for row in history[1:]))
+
+    def test_regressive_draft_is_not_resumed_as_the_editing_checkpoint(self):
+        previous = []
+
+        def fake(prompt, schema, outdir, name, *args, **kwargs):
+            if name == 'source-repair':
+                value = {'findings': [], 'summary': 'Reviewed supplied source'}
+            else:
+                value = copy.deepcopy(self.bundle if name == 'draft' else self.review)
+            if name == 'draft':
+                previous.append(prompt)
+                if len(previous) < 3:
+                    value['facts'][0]['evidence'][0]['quote'] = 'missing first quote'
+                if len(previous) == 2:
+                    value['facts'][1]['evidence'][0]['quote'] = 'regression with new missing second quote'
+            return self.save_model_output(outdir, name, value)
+
+        with patch('hkipo.writer.load_skill', return_value='fixed specification'), \
+             patch('hkipo.writer.run_codex', side_effect=fake):
+            first = self.write_fixture(max_revisions=1)
+            second = self.write_fixture(max_revisions=1)
+        self.assertEqual(first['status'], 'revision_pending')
+        self.assertIn('attempt-1', first['bundle_path'])
+        self.assertEqual(second['status'], 'ready_for_delivery')
+        prior_draft = json.loads(previous[2].split('\n待修订上一稿：\n', 1)[1])
+        self.assertEqual(prior_draft['facts'][0]['evidence'][0]['quote'], 'missing first quote')
+        self.assertEqual(prior_draft['facts'][1]['evidence'][0]['quote'], 'price 10.00')
+
+    def test_interrupted_render_resumes_approved_checkpoint_without_model_calls(self):
+        def fake(prompt, schema, outdir, name, *args, **kwargs):
+            return self.save_model_output(outdir, name, self.bundle if name == 'draft' else self.review)
+
+        with patch('hkipo.writer.load_skill', return_value='fixed specification'), \
+             patch('hkipo.writer.run_codex', side_effect=fake) as model:
+            with patch('hkipo.writer.render_bundle', side_effect=OSError('Transient renderer failure')):
+                with self.assertRaisesRegex(OSError, 'Transient renderer failure'):
+                    self.write_fixture(max_revisions=1)
+            result = self.write_fixture(max_revisions=1)
+        self.assertEqual(result['status'], 'ready_for_delivery')
+        self.assertEqual(result['attempt'], 1)
+        self.assertEqual([call.args[3] for call in model.call_args_list], ['draft', 'review'])
 
     def test_download_timestamps_do_not_invalidate_repair_checkpoint(self):
         one={'event':{'event_id':'same','kind':'offer','stock_code':'03275',

@@ -25,6 +25,10 @@ class DeliveryError(RuntimeError):
     """Messages contain only safe codes, never transport exception bodies."""
 
 
+class BeforeArticleDelivery(DeliveryError):
+    """The transport has not attempted to deliver the email or write a draft."""
+
+
 def sha(data):return hashlib.sha256(data).hexdigest()
 def fingerprint(value):return sha(json.dumps(value,sort_keys=True,ensure_ascii=False,separators=(',',':')).encode())
 def read_json(path):return json.loads(Path(path).read_text(encoding='utf-8'))
@@ -120,16 +124,22 @@ def verify_release(release):
 
 
 def smtp_send(config,message,recipient):
-    """One SMTP attempt. Return only a safe receipt; all failures are uncertain."""
+    """Distinguish a connection/login failure from uncertainty after sendmail."""
+    attempted=False;accepted=False
     try:
         with smtplib.SMTP_SSL(config['smtp_host'],int(config['smtp_port']),timeout=30) as smtp:
             smtp.login(config['user'],config['password'])
+            attempted=True
             refused=smtp.sendmail(config['user'],[recipient],message.as_bytes(policy=SMTP))
             if refused:raise DeliveryError('smtp_recipient_refused')
-        return {'message_id':message['Message-ID'],'smtp_accepted':True}
+            accepted=True
     except DeliveryError:raise
+    except (smtplib.SMTPRecipientsRefused,smtplib.SMTPSenderRefused):
+        raise BeforeArticleDelivery('smtp_envelope_refused') from None
     except Exception:
-        raise DeliveryError('smtp_outcome_unconfirmed') from None
+        if not attempted:raise BeforeArticleDelivery('smtp_connection_or_login_failed') from None
+        if not accepted:raise DeliveryError('smtp_outcome_unconfirmed') from None
+    return {'message_id':message['Message-ID'],'smtp_accepted':True}
 
 class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self,*args,**kwargs):raise DeliveryError('wechat_redirect_rejected')
@@ -222,6 +232,12 @@ class Deliverer:
             c.execute("INSERT INTO deliveries VALUES(?,?,?,'unknown',NULL,?)",(key,event_id,channel,utcnow()))
         return None
 
+    def _retry_unsent(self,key,reason):
+        # Only the reservation owner may call before attempting the side effect.
+        # Other workers see an unknown reservation until this transaction ends.
+        removed=self.store.release_unsent_delivery(key)
+        return {'status':'retryable' if removed else 'needs_reconciliation','delivery_key':key,'error':reason}
+
     def email(self,release,recipient=DEFAULT_RECIPIENT,*,subject_prefix=''):
         frozen=verify_release(release)
         if not isinstance(recipient,str) or '\n' in recipient or '\r' in recipient or recipient.count('@')!=1:raise DeliveryError('invalid_recipient')
@@ -252,6 +268,8 @@ class Deliverer:
             safe_receipt={'message_id':str(receipt['message_id']),'smtp_accepted':True,'payload_sha256':fingerprint(payload)}
             self.store.finish_delivery(key,'confirmed',safe_receipt)
             return {'status':'confirmed','delivery_key':key,'receipt':safe_receipt}
+        except BeforeArticleDelivery:
+            return self._retry_unsent(key,'smtp_delivery_not_started')
         except Exception:
             # Reservation remains unknown even on an explicit rejection; no
             # automatic retry is safe once a transport has been entered.
@@ -299,6 +317,9 @@ class Deliverer:
         if prior:return prior
         try:
             token=self.wechat.token(cfg)
+        except Exception:
+            return self._retry_unsent(key,'wechat_token_unavailable')
+        try:
             media_cover=thumb_media_id or self.wechat.cover(token,*cover)
             body=upload_personal_qr(body,self.wechat,token)
             article={'article_type':'news','title':title,'content':body,'thumb_media_id':media_cover,**metadata}

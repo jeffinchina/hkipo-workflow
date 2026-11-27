@@ -8,9 +8,9 @@ from datetime import datetime,timezone
 import json
 from pathlib import Path
 import re
-from .delivery import Deliverer
+from .delivery import Deliverer,DeliveryError
 from .quota import QuotaDeferred,QuotaUnavailable,quota_deferral
-from .release_worker import prepare_release
+from .release_worker import prepare_release,RenderUnavailable,WordLayoutRejected
 from .service import singleton_lock,write_json
 from .store import StateStore
 
@@ -51,6 +51,13 @@ class Publisher:
             c.execute('INSERT OR REPLACE INTO publication_runs VALUES(?,?,?,?)',(rid,status,json.dumps(report,ensure_ascii=False),retry))
         return {'research_id':rid,'status':status,**report}
 
+    def _retry(self,row,reason,report):
+        previous=json.loads(row['previous_report']) if row['previous_report'] else {}
+        delays=(60,300,900,1800)
+        attempt=min(previous.get('recovery_attempt',0)+1,len(delays)) if previous.get('reason')==reason else 1
+        retry=datetime.now(timezone.utc).timestamp()+delays[attempt-1]
+        return self._record(row['research_id'],'deferred',{**report,'reason':reason,'recovery_attempt':attempt,'retry_at':retry},retry)
+
     def _eligible(self,payload):
         event=payload.get('event',{});eid=event.get('event_id')
         if self.settings.acceptance_mode:
@@ -69,7 +76,7 @@ class Publisher:
             if cfg.enable_deliveries and not (cfg.production_accepted or cfg.acceptance_mode):
                 return {'status':'blocked','reason':'real_delivery_acceptance_required','results':[]}
             with self.store.connect() as c:
-                rows=c.execute("SELECT r.* FROM research_runs r LEFT JOIN publication_runs p USING(research_id) WHERE r.status='ready_for_delivery' AND (p.status IS NULL OR (p.status='deferred' AND (p.retry_at IS NULL OR p.retry_at<=?)) OR (p.status='prepared' AND ?)) ORDER BY r.updated_at LIMIT ?",(datetime.now(timezone.utc).timestamp(),cfg.enable_deliveries,cfg.max_jobs)).fetchall()
+                rows=c.execute("SELECT r.*,p.report AS previous_report FROM research_runs r LEFT JOIN publication_runs p USING(research_id) WHERE r.status='ready_for_delivery' AND (p.status IS NULL OR (p.status='deferred' AND (p.retry_at IS NULL OR p.retry_at<=?)) OR (p.status='prepared' AND ?)) ORDER BY r.updated_at LIMIT ?",(datetime.now(timezone.utc).timestamp(),cfg.enable_deliveries,cfg.max_jobs)).fetchall()
             results=[]
             for row in rows:
                 rid=row['research_id']
@@ -91,15 +98,27 @@ class Publisher:
                         results.append(self._record(rid,'blocked',{'reason':'queued_writer_request_changed'}));continue
                     if release['event_id']!=payload['event']['event_id']:
                         raise ValueError('Release identity differs from queued event')
+                    selected=self.store.research_run(rid)
+                    if not selected or selected['status']!='ready_for_delivery':
+                        results.append(self._record(rid,'superseded',{'reason':'newer_research_ready'}));continue
                     if not cfg.enable_deliveries:
                         results.append(self._record(rid,'prepared',{'release_path':str(job/'release.json'),'delivery_enabled':False}));continue
                     sender=self.deliverer or Deliverer(self.store,config_path=cfg.private_config)
-                    email=sender.email(release)
-                    draft=sender.draft(release,thumb_media_id=cfg.thumb_media_id,update_existing=True)
+                    try:email=sender.email(release)
+                    except DeliveryError:email={'status':'blocked','error':'email_preparation_failed'}
+                    try:draft=sender.draft(release,thumb_media_id=cfg.thumb_media_id,update_existing=True)
+                    except DeliveryError:draft={'status':'blocked','error':'draft_preparation_failed'}
                     confirmed={'confirmed','already_confirmed'}
-                    state='delivered' if email.get('status') in confirmed and draft.get('status') in confirmed else 'needs_attention'
                     report={'email':email,'draft':draft,'release_path':str(job/'release.json')}
-                    results.append(self._record(rid,state,report))
+                    outcomes={email.get('status'),draft.get('status')}
+                    if 'retryable' in outcomes:
+                        results.append(self._retry(row,'delivery_preflight_retry',report))
+                    else:
+                        results.append(self._record(rid,'delivered' if outcomes<=confirmed else 'needs_attention',report))
+                except RenderUnavailable as exc:
+                    results.append(self._retry(row,'word_render_unavailable',{'failures':exc.failures}))
+                except WordLayoutRejected:
+                    results.append(self._record(rid,'needs_attention',{'reason':'word_layout_rejected'}))
                 except QuotaDeferred as exc:
                     deferred=quota_deferral(exc.observation)
                     results.append(self._record(rid,'deferred' if deferred else 'blocked',{'reason':'quota_deferred' if deferred else 'quota_unverified_or_hard_limit','observation':exc.observation},deferred['retry_at'] if deferred else None))
@@ -113,8 +132,10 @@ class Publisher:
             with self.store.connect() as c:
                 attention=[{'research_id':r['research_id'],'status':r['status']}
                     for r in c.execute("SELECT research_id,status FROM publication_runs WHERE status IN ('blocked','needs_attention')")]
-            return {'status':'needs_attention' if attention else 'ok','ok':not attention,
-                    'delivery_enabled':cfg.enable_deliveries,'attention':attention,'results':results}
+                recovery=[{'research_id':r['research_id'],'reason':json.loads(r['report']).get('reason'),'retry_at':r['retry_at']}
+                    for r in c.execute("SELECT research_id,report,retry_at FROM publication_runs WHERE status='deferred' ORDER BY retry_at")]
+            return {'status':'needs_attention' if attention else ('recovering' if recovery else 'ok'),'ok':not attention,
+                    'delivery_enabled':cfg.enable_deliveries,'attention':attention,'recovery':recovery,'results':results}
 
     def run_loop(self,stop,max_cycles=None):
         cycles=0;last=None

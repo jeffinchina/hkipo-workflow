@@ -12,6 +12,9 @@ import uuid
 from .downloads import DownloadError
 from .quota import quota_deferral
 
+SOURCE_RECHECK_SECONDS=900
+SOURCE_WAIT_REASON='authoritative_source_unresolved'
+
 class Worker:
     def __init__(self,store,downloader,job_root,skill_paths,writer=None,worker_id=None,lease_seconds=1800,max_attempts=3,auto_article_kinds=None):
         self.store=store;self.downloader=downloader;self.root=Path(job_root).resolve();self.root.mkdir(parents=True,exist_ok=True)
@@ -61,6 +64,10 @@ class Worker:
             previous=self.store.research_run(research_id)
             if previous and previous['status']=='ready_for_delivery':
                 return self._finish(claim,'ready_for_delivery','existing_identical_source_hashes')
+            if previous and previous['status']=='awaiting_source':
+                # Hashes are checked against a fresh official download. Keep
+                # the reviewed manuscript while the evidence is unchanged.
+                return self._finish(claim,'awaiting_source',SOURCE_WAIT_REASON,SOURCE_RECHECK_SECONDS)
             if lost.is_set() or not self.store.renew_claim(claim['token'],self.lease_seconds):return {'status':'lease_lost','event_ids':claim['event_ids']}
             logical_event_id=hashlib.sha256(json.dumps({'stock_code':seed['stock_code'],'kind':seed['kind'],'episode_id':episode},sort_keys=True).encode()).hexdigest()
             event=dict(seed,event_id=logical_event_id,research_id=research_id,source_event_ids=[e['event_id'] for e,_ in downloads],source_events=[e for e,_ in downloads],source_hashes=[d.to_dict() for _,d in downloads],episode_id=episode)
@@ -80,9 +87,14 @@ class Worker:
             if verified:
                 committed=self.store.defer_research_claim(claim['token'],research_id,{'event':event,'writer_result':result,'source_identity':identity},verified)
                 return {'status':'deferred' if committed else 'lease_lost','event_ids':claim['event_ids'],'research_id':research_id,'reason':verified['reason'],'retry_at':verified['retry_at']}
-            status=result['status'] if result.get('status') in {'ready_for_delivery','revision_pending'} else 'blocked'
+            status={'ready_for_delivery':'ready_for_delivery','revision_pending':'revision_pending',
+                    'needs_source':'awaiting_source'}.get(result.get('status'),'blocked')
             reason=None if status=='ready_for_delivery' else (result.get('reason') or 'writer_requires_attention')
-            committed=self.store.finish_research_claim(claim['token'],research_id,{'event':event,'writer_result':result,'source_identity':identity},status,reason)
+            interval=result.get('retry_after_seconds')
+            retry=interval if type(interval) is int and 1<=interval<=3600 else 60
+            if status=='awaiting_source':
+                reason=SOURCE_WAIT_REASON;retry=SOURCE_RECHECK_SECONDS
+            committed=self.store.finish_research_claim(claim['token'],research_id,{'event':event,'writer_result':result,'source_identity':identity},status,reason,retry_seconds=retry)
             answer={'status':status if committed else 'lease_lost','event_ids':claim['event_ids'],'reason':reason}
             if not committed:return answer
             self.store.record_stage(claim['event_ids'],'written',{'research_id':research_id,'status':status,'written_at':datetime.now(timezone.utc).isoformat()})
@@ -90,7 +102,12 @@ class Worker:
             return answer
         except DownloadError as error:
             self.store.record_stage(claim['event_ids'],'blocked',{'safe_error':str(error)})
-            return self._finish(claim,'failed','download_failed',retry=max(300,int(getattr(error,'retry_after',None) or 0)+1))
+            if error.retry_after is not None:
+                return self._finish(claim,'awaiting_source','official_download_rate_limited',max(300,int(error.retry_after)+1))
+            if claim['rechecking_sources'] or (claim['attempts']>=self.max_attempts and str(error) in {
+                    'download_recovery_exhausted','download_transport_failed','http_status_404'}):
+                return self._finish(claim,'awaiting_source','official_download_retry',SOURCE_RECHECK_SECONDS)
+            return self._finish(claim,'failed','download_failed',retry=300)
         except Exception as error:
             # Never persist raw model/HTTP error messages, which may contain
             # headers, private configuration or prompt contents.

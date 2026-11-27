@@ -109,12 +109,17 @@ def run_codex(prompt, schema, outdir, name, model="gpt-6.1-sol", effort="medium"
     result = outdir / (name + ".json")
     schema_file = outdir / (name + ".schema.json")
     digest_file = outdir / (name + ".input-sha256")
+    completion_file = outdir / (name + ".completion.json")
     images = [Path(p).resolve(strict=True) for p in (images or [])]
     image_hashes = [(str(p), hashlib.sha256(p.read_bytes()).hexdigest()) for p in images]
     digest = fingerprint({"prompt": prompt, "schema": schema, "model": model, "effort": effort,
                           "images": image_hashes})
-    if result.is_file() and digest_file.is_file() and digest_file.read_text() == digest:
-        return json.loads(result.read_text())
+    if result.is_file() and digest_file.is_file() and completion_file.is_file() and digest_file.read_text() == digest:
+        completion = json.loads(completion_file.read_text())
+        raw_output = result.read_bytes()
+        if (completion.get('success') is True and
+                completion.get('output_sha256') == hashlib.sha256(raw_output).hexdigest()):
+            return json.loads(raw_output)
     save_json(schema_file, schema)
     from .network import child_environment, resolve_cli
     settings_path = settings_path or os.environ.get("HKIPO_SETTINGS")
@@ -135,6 +140,8 @@ def run_codex(prompt, schema, outdir, name, model="gpt-6.1-sol", effort="medium"
     # Never pass a prior successful result as output of a failed new process.
     if result.exists():
         result.replace(result.with_suffix(".previous.json"))
+    digest_file.unlink(missing_ok=True)
+    completion_file.unlink(missing_ok=True)
     with (outdir / (name + ".events.jsonl")).open("w") as events, (outdir / (name + ".stderr.log")).open("w") as errors:
         started = time.monotonic()
         try:
@@ -150,10 +157,13 @@ def run_codex(prompt, schema, outdir, name, model="gpt-6.1-sol", effort="medium"
                 proc.wait()
             raise RuntimeError("Writing stage timed out; saved for bounded retry")
     completion = completion_summary((outdir / (name + ".events.jsonl")).read_text(), proc.returncode)
-    save_json(outdir / (name + ".completion.json"), completion)
+    save_json(completion_file, completion)
     if not completion["success"] or not result.is_file():
         raise RuntimeError(f"Codex stage {name} did not complete (exit {proc.returncode}); inspect local logs")
-    output = json.loads(result.read_text())
+    raw_output = result.read_bytes()
+    output = json.loads(raw_output)
+    completion['output_sha256'] = hashlib.sha256(raw_output).hexdigest()
+    save_json(completion_file, completion)
     digest_file.write_text(digest)
     save_json(outdir / (name + ".run.json"), {"model": model, "effort": effort,
               "seconds": round(time.monotonic() - started, 2), "input_sha256": digest})
@@ -276,59 +286,177 @@ def _write_article(event, pdf_paths, job_dir, skill_path, author_inputs=None,
         from .offer_editorial import READER_POLICY
         context += '\n'+READER_POLICY
     source_section = "\n以下是全部原文，不得只看前文或目录：\n" + full_source
-    feedback = ""
     auto_scope_attempted = False
-    from .revision import issue_snapshot, repair_feedback, source_repair, requested_pages, repair_visual_pages
+    from .revision import (MAX_REVIEW_ROUNDS, RECOVERY_TACTICS, InvalidSourceRepair,
+        issue_snapshot, repair_feedback, source_repair, requested_pages, repair_visual_pages)
+
+    def identity_errors(bundle):
+        errors = []
+        if bundle.get("event_id") != event["event_id"] or bundle.get("kind") != kind:
+            errors.append('Model returned mismatched event identity')
+        codes = [f for f in bundle.get("facts", []) if f.get("key") == "stock_code"]
+        if event.get("stock_code") and (len(codes) != 1 or
+                str(codes[0].get("value", "")).zfill(5) != str(event["stock_code"]).zfill(5)):
+            errors.append('Official-source stock code does not match monitored event')
+        return errors
+
+    def apply_identity_errors(quality, errors):
+        if errors:
+            quality['blocking'].extend(errors)
+            quality['pass'] = False
+
+    def checkpoint_paths(stage):
+        return {key + '_path': str(stage / name) for key, name in
+            (('bundle', 'draft.json'), ('review', 'review.json'), ('quality', 'quality.json'))}
+
+    def render_ready(checkpoint):
+        stage = checkpoint['stage']
+        output = stage / 'output'
+        render_manifest = render_bundle(checkpoint['bundle'], output, include_docx=include_docx)
+        render_manifest['source_mode'] = source_mode
+        render_path = output / 'render-manifest.json'
+        if render_path.exists():
+            rendered = json.loads(render_path.read_text())
+            rendered['source_mode'] = source_mode
+            save_json(render_path, rendered)
+        status = {'status': 'ready_for_delivery', 'attempt': checkpoint['attempt'],
+                  **checkpoint_paths(stage), 'output_dir': str(output), 'render': render_manifest,
+                  'visual_registry': str(Path(visual_registry).resolve()) if visual_registry else None}
+        if scopes:
+            status['scoped_visual_registry'] = str(Path(scoped_visual_registry).resolve())
+            status['scope_approval_registry'] = str(Path(scope_approval_registry).resolve())
+        save_json(job_dir / 'status.json', status)
+        return status
+
     history = []
-    findings = None
-    # Resume completed draft/review pairs from the exact same source/spec/run.
-    # Interrupted model outputs are never trusted as a completed checkpoint.
+    best = None
+    latest = None
+    attempted_tactics = set()
+
+    def remember(stage, bundle, review, quality, tactic, resumed=False):
+        nonlocal best, latest
+        attempt = int(stage.name.split('-')[-1])
+        issues = issue_snapshot(bundle, review, quality)
+        remaining = sum(len(problems) for problems in issues.values())
+        prior_issues = set(best['issues']) if best else set()
+        improved = best is None or remaining < best['remaining'] or quality['pass']
+        latest = {'stage': stage, 'attempt': attempt, 'bundle': bundle, 'review': review,
+                  'quality': quality, 'remaining': remaining, 'issues': issues}
+        if improved:
+            best = latest
+            attempted_tactics.clear()
+        elif tactic in RECOVERY_TACTICS:
+            attempted_tactics.add(tactic)
+        history.append({'attempt': attempt, 'remaining': remaining, 'issues': issues,
+                        'resolved': sorted(prior_issues - issues.keys()),
+                        'opened': sorted(issues.keys() - prior_issues),
+                        'bundle_sha256': fingerprint(bundle), 'strategy': tactic,
+                        'best_attempt': best['attempt'], 'improved': improved, 'resumed': resumed})
+
+    def next_tactic():
+        return next((tactic for tactic in RECOVERY_TACTICS if tactic not in attempted_tactics), None)
+
+    # Only completed pairs on the same source/version enter recovery. An
+    # interrupted attempt can reuse a successfully cached model step.
     start_attempt = 0
-    previous_stages = sorted(run_dir.glob('attempt-*'), key=lambda p: int(p.name.split('-')[-1]))
-    for previous in previous_stages if source_mode == 'text_first' else []:
-        required = ['draft.json', 'review.json', 'quality.json', 'draft.completion.json', 'review.completion.json']
-        if not all((previous / name).is_file() for name in required):
+    previous_stages = (p for p in run_dir.glob('attempt-*') if p.name.removeprefix('attempt-').isdigit())
+    for previous in sorted(previous_stages, key=lambda p: int(p.name.split('-')[-1])) if source_mode == 'text_first' else []:
+        files = [previous / name for name in
+            ('draft.json', 'review.json', 'quality.json', 'draft.completion.json', 'review.completion.json')]
+        if not all(path.is_file() for path in files):
             break
-        if not all(json.loads((previous / (name+'.completion.json')).read_text()).get('success')
-                   for name in ('draft', 'review')):
+        try:
+            outputs = [path.read_bytes() for path in files[:2]]
+            complete = [json.loads(path.read_text()) for path in files[3:]]
+            if any(row.get('success') is not True or (row.get('output_sha256') and
+                   row['output_sha256'] != hashlib.sha256(raw).hexdigest()) for row, raw in zip(complete, outputs)):
+                break
+            bundle, review = [json.loads(raw) for raw in outputs]
+            record = previous / 'recovery-attempt.json'
+            recorded = json.loads(record.read_text()) if record.is_file() else {}
+            if recorded and (recorded.get('draft_sha256') != fingerprint(bundle) or
+                             recorded.get('review_sha256') != fingerprint(review)):
+                break
+            quality = validate_bundle(bundle, manifest, review, visual_reviews=visual_paths,
+                trusted_visual_review_sha256s=visual_hashes, source_mode=source_mode)
+            apply_identity_errors(quality, identity_errors(bundle))
+            if kind == 'offer' and 'OFFER_EDITORIAL_V' in specification:
+                from .offer_editorial import apply_offer_editorial
+                apply_offer_editorial(quality, bundle)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
             break
-        bundle = json.loads((previous/'draft.json').read_text())
-        review = json.loads((previous/'review.json').read_text())
-        quality = validate_bundle(bundle, manifest, review, visual_reviews=visual_paths,
-            trusted_visual_review_sha256s=visual_hashes, source_mode=source_mode)
-        if kind == 'offer' and 'OFFER_EDITORIAL_V' in specification:
-            from .offer_editorial import apply_offer_editorial
-            apply_offer_editorial(quality, bundle)
         start_attempt = int(previous.name.split('-')[-1])
-        snapshot = issue_snapshot(bundle, review, quality)
-        history.append({'attempt': start_attempt, 'remaining': len(snapshot), 'issues': snapshot,
-                        'bundle_sha256': fingerprint(bundle), 'resumed': True})
-    def research_failed_sources(review, destination):
+        remember(previous, bundle, review, quality, recorded.get('strategy', 'previous'), resumed=True)
+        if quality['pass']:
+            save_json(previous / 'quality.json', quality)
+            return render_ready(best)
+
+    def research_failed_sources(review, quality, destination):
         nonlocal visual_registry, visual_paths, visual_hashes, visual, source_section
-        pages = requested_pages(review, manifest)
-        if pages:
-            visual_registry = repair_visual_pages(manifest, pages,
-                visual_registry or job_dir/'targeted-visual/registry.json',
-                destination/'source-visual', run_codex, model=model, effort=visual_effort,
+        selected = set()
+        def inspect_pages(findings=None):
+            nonlocal visual_registry, visual_paths, visual_hashes, visual, source_section
+            pages = [r for r in requested_pages(review, manifest, findings)
+                     if (r['document_id'], r['pdf_page']) not in visual and (r['document_id'], r['pdf_page']) not in selected]
+            batch = pages[:8 - len(selected)]
+            if not batch:
+                return
+            visual_registry = repair_visual_pages(manifest, batch,
+                visual_registry or job_dir / 'targeted-visual/registry.json',
+                destination / 'source-visual', run_codex, model=model, effort=visual_effort,
                 settings_path=settings_path)
+            selected.update((r['document_id'], r['pdf_page']) for r in batch)
             visual_paths, visual_hashes, visual = trusted_visuals(visual_registry, manifest)
             source_section = '\n以下是全部原文及已可信的定向图审，其余图片未审：\n' + documents_context(manifest, visual)
-        return source_repair(manifest, review, context, run_codex, destination,
-            model=model, effort=review_effort, settings_path=settings_path)
-    if start_attempt:
-        if review.get('decision') == 'needs_source' and max_revisions:
-            findings = research_failed_sources(review, run_dir / f'attempt-{start_attempt+1}')
-        feedback = repair_feedback(bundle, review, quality, findings, history)
-    stage = run_dir / f'attempt-{max(1, start_attempt)}'
-    best = (len(issue_snapshot(bundle, review, quality)), bundle, review, quality) if start_attempt else None
-    # Each dispatch is finite; a progressing job continues from persisted rounds
-    # rather than being discarded or starting a new whole-book draft.
+        inspect_pages()
+        try:
+            findings = source_repair(manifest, review, context, run_codex, destination,
+                model=model, effort=review_effort, settings_path=settings_path, visual=visual, quality=quality)
+        except InvalidSourceRepair as exc:
+            # The unsupported research output is audited and excluded from the
+            # edit. Infrastructure failures still use the worker's retry path.
+            save_json(destination / 'source-repair.rejected.json', {'reason': str(exc)})
+            return None
+        inspect_pages(findings)
+        return findings
+
+    def source_wait(checkpoint):
+        review = checkpoint['review']
+        pages = requested_pages(review, manifest)
+        blocking = checkpoint['quality']['blocking']
+        unreadable = [reason for reason in blocking if 'unreadable PDF pages' in reason]
+        work = [i['problem'] for i in review.get('issues', []) if i['severity'] == 'blocking'] + unreadable
+        if review.get('decision') == 'needs_source' and not work:
+            work = [review.get('summary') or 'Independent review requires additional official evidence.']
+        return {'documents': [{'document_id': d['document_id'], 'sha256': d['sha256']}
+                              for d in manifest['documents']],
+                'requested_pages': pages, 'remaining_work': list(dict.fromkeys(work))}
+
+    baseline = best['remaining'] if best else None
     end_attempt = start_attempt + max_revisions + 1
+    if source_mode == 'text_first':
+        # Rounds persisted before staged recovery did not use these tactics.
+        previous_rounds = sum(row['strategy'] == 'previous' for row in history)
+        round_limit = previous_rounds + MAX_REVIEW_ROUNDS
+        end_attempt = min(end_attempt, round_limit)
     try:
         for attempt in range(start_attempt, end_attempt):
-            stage = run_dir / f"attempt-{attempt + 1}"
+            stage = run_dir / f'attempt-{attempt + 1}'
+            tactic = next_tactic() if best and source_mode == 'text_first' else ('targeted' if best else 'initial')
+            if tactic is None:
+                break
+            stage.mkdir(exist_ok=True)
+            findings = None
+            feedback = ''
+            if best:
+                bundle, review, quality = best['bundle'], best['review'], best['quality']
+                source_requested = review.get('decision') == 'needs_source'
+                if source_mode == 'text_first' and max_revisions and (
+                        tactic == 'evidence_reconciliation' or (source_requested and tactic == 'targeted')):
+                    findings = research_failed_sources(review, quality, stage)
+                feedback = repair_feedback(review, quality, findings, history[-3:], tactic=tactic)
             revision_source = source_section
-            if attempt and source_mode == "text_first":
+            if best and source_mode == 'text_first':
                 coverage_failed = any(issue.startswith('sources_seen:') for issue in quality['blocking'])
                 refs = [r for f in bundle.get("facts", []) for r in f.get("evidence", [])]
                 refs += [r for issue in review.get("issues", []) for r in issue.get("source_refs", [])]
@@ -346,6 +474,8 @@ def _write_article(event, pdf_paths, job_dir, skill_path, author_inputs=None,
                         "独立复核另行运行，不能代填其结果。"
                         + source_section
                     )
+                elif tactic == 'evidence_reconciliation' or findings:
+                    revision_source = source_section
                 else:
                     revision_source = (
                         "\n以下是稿件及复核引用页原文。仅定向修订，保留未变事实。"
@@ -356,17 +486,15 @@ def _write_article(event, pdf_paths, job_dir, skill_path, author_inputs=None,
                 revision_source += "\n待修订上一稿：\n" + json.dumps(bundle, ensure_ascii=False)
             prompt = COMMON + context + "\n请先建立事实账本，再写可读文章。" + feedback + revision_source
             bundle = run_codex(prompt, ARTICLE_SCHEMA, stage, "draft", model, effort, settings_path=settings_path)
-            if bundle.get("event_id") != event["event_id"] or bundle.get("kind") != kind:
-                raise ValueError("Model returned mismatched event identity")
-            codes = [f for f in bundle.get("facts", []) if f.get("key") == "stock_code"]
-            if event.get("stock_code") and (len(codes) != 1 or
-                    str(codes[0].get("value", "")).zfill(5) != str(event["stock_code"]).zfill(5)):
-                raise ValueError("Official-source stock code does not match monitored event")
+            errors = identity_errors(bundle)
+            if errors and source_mode == 'legacy_strict':
+                raise ValueError(errors[0])
             # Mechanical precheck is retained even though missing review blocks
             # delivery. It does not replace the independent semantic check.
             precheck = validate_bundle(bundle, manifest, visual_reviews=visual_paths,
                                        trusted_visual_review_sha256s=visual_hashes,
                                        scoped_visual_registry=scoped_visual_registry, source_mode=source_mode)
+            apply_identity_errors(precheck, errors)
             if event['kind']=='offer' and 'OFFER_EDITORIAL_V' in specification:
                 from .offer_editorial import apply_offer_editorial
                 apply_offer_editorial(precheck,bundle)
@@ -390,6 +518,7 @@ def _write_article(event, pdf_paths, job_dir, skill_path, author_inputs=None,
                                       scoped_visual_registry=scoped_visual_registry,
                                       scope_approval_registry=scope_approval_registry,
                                       bundle_path=stage / 'draft.json', review_path=stage / 'review.json', source_mode=source_mode)
+            apply_identity_errors(quality, errors)
             if event['kind']=='offer' and 'OFFER_EDITORIAL_V' in specification:
                 apply_offer_editorial(quality,bundle)
             auto_scope_result = None
@@ -413,17 +542,14 @@ def _write_article(event, pdf_paths, job_dir, skill_path, author_inputs=None,
                     auto_scope_result = {'approved': False, 'reason': type(exc).__name__, 'message': str(exc)}
                 save_json(stage / 'auto-scope-result.json', auto_scope_result)
             save_json(stage / "quality.json", quality)
-            snapshot = issue_snapshot(bundle, review, quality)
-            old = set(history[-1]['issues']) if history else set()
-            current = set(snapshot)
-            history.append({'attempt': attempt+1, 'remaining': len(snapshot), 'issues': snapshot,
-                            'resolved': sorted(old-current), 'opened': sorted(current-old),
-                            'bundle_sha256': fingerprint(bundle)})
+            save_json(stage / 'recovery-attempt.json', {'strategy': tactic,
+                'draft_sha256': fingerprint(bundle), 'review_sha256': fingerprint(review)})
+            remember(stage, bundle, review, quality, tactic)
             save_json(run_dir / 'revision-history.json', history)
-            save_json(job_dir / 'revision-progress.json', {'status': 'passed' if quality['pass'] else 'revising',
-                'attempt': attempt+1, 'remaining': len(snapshot), 'history_path': str(run_dir/'revision-history.json')})
-            if best is None or len(snapshot) <= best[0]:
-                best = (len(snapshot), bundle, review, quality)
+            save_json(job_dir / 'revision-progress.json', {
+                'status': 'passed' if quality['pass'] else 'revising', 'attempt': attempt + 1,
+                'remaining': best['remaining'], 'best_attempt': best['attempt'], 'strategy': tactic,
+                'history_path': str(run_dir / 'revision-history.json')})
             if scopes and quality['blocking'] and all(x == 'scoped dependency approval missing; delivery forbidden' or x.startswith('scoped visual review:') for x in quality['blocking']):
                 status = {"status": "needs_scoped_visual_review", "attempt": attempt + 1,
                           "bundle_path": str(stage / "draft.json"), "review_path": str(stage / "review.json"),
@@ -435,57 +561,32 @@ def _write_article(event, pdf_paths, job_dir, skill_path, author_inputs=None,
                     status['auto_scope_review'] = auto_scope_result
                 save_json(job_dir / 'status.json', status)
                 return status
-            if quality["pass"]:
-                render_manifest = render_bundle(bundle, stage / "output", include_docx=include_docx)
-                render_manifest["source_mode"] = source_mode
-                render_path = stage / "output" / "render-manifest.json"
-                if render_path.exists():
-                    rendered = json.loads(render_path.read_text())
-                    rendered["source_mode"] = source_mode
-                    save_json(render_path, rendered)
-                status = {"status": "ready_for_delivery", "attempt": attempt + 1,
-                          "bundle_path": str(stage / "draft.json"), "review_path": str(stage / "review.json"),
-                          "quality_path": str(stage / "quality.json"), "output_dir": str(stage / "output"),
-                          "visual_registry": str(Path(visual_registry).resolve()) if visual_registry else None,
-                          "render": render_manifest}
-                if scopes:
-                    status['scoped_visual_registry'] = str(Path(scoped_visual_registry).resolve())
-                    status['scope_approval_registry'] = str(Path(scope_approval_registry).resolve())
-                save_json(job_dir / "status.json", status)
-                return status
-            if review.get("decision") == "needs_source" and (source_mode != 'text_first' or max_revisions == 0):
-                import re
-                requested = {}
-                known = {d["document_id"]: d["pages_total"] for d in manifest["documents"]}
-                for issue in review.get("issues", []):
-                    if issue.get("severity") != "blocking":
-                        continue
-                    for did, number in re.findall(r"\[visual_page:([a-f0-9]{12}):([0-9]+)\]", issue.get("problem", "")):
-                        if did in known and 1 <= int(number) <= known[did]:
-                            requested[(did, int(number))] = {"document_id": did, "pdf_page": int(number), "reason": issue["problem"]}
-                if source_mode == "text_first":
-                    status = {"status": "needs_source", "reason": "independent_review_requested_source",
-                              "pages": list(requested.values())[:8], "request_overflow": len(requested) > 8,
-                              "bundle_path": str(stage / "draft.json"), "review_path": str(stage / "review.json"),
-                              "quality_path": str(stage / "quality.json"), "gaps": bundle.get("gaps", [])}
-                    save_json(job_dir / "status.json", status)
-                    return status
+            if quality['pass']:
+                return render_ready(best)
+            if review.get('decision') == 'needs_source' and (source_mode != 'text_first' or max_revisions == 0):
                 break
-            if len(snapshot) > best[0]:
-                # Reject regression as the next editing base. Keep its audit.
-                _, bundle, review, quality = best
-            if review.get('decision') == 'needs_source' and attempt+1 < end_attempt:
-                findings = research_failed_sources(review, run_dir / f'attempt-{attempt+2}')
-            feedback = repair_feedback(bundle, review, quality, findings, history)
-        progressing = (len(history) > 1 and history[-1]['remaining'] < history[0]['remaining']
-                       and min(r['remaining'] for r in history[-3:])
-                           < min((r['remaining'] for r in history[:-3]), default=history[0]['remaining'])
-                       and len({r['bundle_sha256'] for r in history[-3:]}) > 1)
-        status = {"status": "revision_pending" if progressing else "needs_attention",
-                  "reason": "revision_batch_continuation" if progressing else "revision_stalled_or_source_unresolved",
-                  "quality_path": str(stage / "quality.json"), "bundle_path": str(stage/'draft.json'),
-                  "review_path": str(stage/'review.json'), "history_path": str(run_dir/'revision-history.json'),
-                  "gaps": bundle.get("gaps", [])}
+
+        status = {'status': 'needs_attention', 'reason': 'revision_recovery_exhausted',
+                  **checkpoint_paths(best['stage']), 'history_path': str(run_dir / 'revision-history.json'),
+                  'gaps': best['bundle'].get('gaps', []),
+                  'recovery': {'best_attempt': best['attempt'], 'last_attempt': history[-1]['attempt'],
+                               'remaining': best['remaining'], 'next_strategy': next_tactic()}}
+        can_continue = (source_mode == 'text_first' and max_revisions and
+                        history[-1]['attempt'] < round_limit and next_tactic() is not None)
+        source_checkpoint = latest if latest['remaining'] == best['remaining'] else best
+        wait = source_wait(source_checkpoint)
+        if can_continue:
+            before = baseline if baseline is not None else history[0]['remaining']
+            progressing = best['remaining'] < before
+            status.update(status='revision_pending',
+                reason='revision_batch_continuation' if progressing else 'revision_recovery_pending',
+                retry_after_seconds=60 if progressing else 120)
+        elif source_checkpoint['review'].get('decision') == 'needs_source' or wait['requested_pages'] or any(
+                'unreadable PDF pages' in issue for issue in source_checkpoint['quality']['blocking']):
+            reason = 'independent_review_requested_source' if max_revisions == 0 else 'authoritative_source_unresolved'
+            pages = wait['requested_pages']
+            status.update(status='needs_source', reason=reason, source_wait=wait,
+                          pages=pages[:8], request_overflow=len(pages) > 8)
     except Exception as exc:
         status = {"status": "deferred", "reason": type(exc).__name__, "message": str(exc),
                   "run_dir": str(run_dir)}

@@ -1,11 +1,15 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import Mock
 from urllib.parse import parse_qs, urlsplit
-from hkipo.sources import TitleSearchSource, SourceError, parse_title_json
+from hkipo.sources import TitleSearchSource, SourceError, SourceResult, parse_title_json
 from hkipo.classification import title_evidence
+from hkipo.monitor import Monitor
+from hkipo.service import LocalService, ServiceSettings
+from hkipo.store import StateStore
 
 
 class TitlePaginationTests(unittest.TestCase):
@@ -137,3 +141,109 @@ class TitleExclusionTests(unittest.TestCase):
                 parse_title_json(json.dumps(dict(self.data,**{key:value})))
         row=dict(self.rows[0]);del row['TITLE']
         with self.assertRaises(SourceError):parse_title_json(json.dumps(dict(self.data,result=[row],recordCnt=1,loadedRecord=1)))
+
+
+class TitleRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        data=json.loads((Path(__file__).parent/'fixtures/title-search-real.json').read_text())
+        self.template=json.loads(data['result'])[0]
+        self.start=datetime(2026,11,19,tzinfo=timezone.utc)
+        self.end=self.start+timedelta(days=1,hours=1)
+        self.client=Mock()
+
+    def row(self,id,day,minute='08:30',**changes):
+        defaults={'NEWS_ID':str(id),'DATE_TIME':f'{day}/11/2026 {minute}',
+                  'STOCK_CODE':'01234','STOCK_NAME':'測試發行人','TITLE':'全球發售',
+                  'FILE_LINK':f'/listedco/listconews/sehk/2026/11{day}/{id}_c.pdf',
+                  'LONG_TEXT':'上市文件 - [發售以供認購]'}
+        return dict(self.template,**(defaults|changes))
+
+    @staticmethod
+    def page(*rows):
+        return json.dumps({'result':rows,'recordCnt':len(rows),'loadedRecord':len(rows),'hasNextRow':False})
+
+    def test_recovery_keeps_old_watermark_and_audits_valid_rows_once(self):
+        bad=self.row(1,19,STOCK_CODE='01234<br>unknown',STOCK_NAME='測試發行人<br>另一發行人')
+        latest=self.row(2,20)
+        older=self.row(3,19)
+        previous=self.row(4,19,'07:30')
+        fixed=dict(bad,STOCK_CODE='01234',STOCK_NAME='測試發行人')
+        primary=self.page(bad,latest,older,previous)
+        self.client.get.side_effect=[
+            self.page(),primary,self.page(latest),self.page(bad,older),
+            primary,self.page(latest),self.page(bad,older,previous),
+            self.page(fixed,latest,older,previous)]
+        with tempfile.TemporaryDirectory() as root:
+            source=TitleSearchSource(self.client)
+            def service():
+                return LocalService(ServiceSettings(root),sources=[source])
+            first=service()
+            first.scan_cycle(self.start)
+            result=first.scan_cycle(self.end)
+            self.assertFalse(result['ok'])
+            self.assertEqual(result['sources'][0]['recovery']['new_events'],2)
+            self.assertEqual(first.store.source_state(source.name)['cutoff'],self.start.isoformat())
+            manifest=next(m for m in first.archive.manifests() if m['source']==source.recovery_name)
+            self.assertFalse(manifest['complete'])
+            self.assertIn('quarantined NEWS_IDs=["1"]',json.loads(manifest['parse_audit'])['partitions'][1])
+            evidence,errors=first.archive.evidence()
+            self.assertEqual({item.locator for item in evidence},{'NEWS_ID:2','NEWS_ID:3'})
+            self.assertFalse(errors)
+
+            restarted=service()
+            result=restarted.scan_cycle(self.end+timedelta(minutes=1))
+            self.assertEqual(len(restarted.store.jobs()),2)
+            self.assertEqual(result['sources'][0]['recovery']['new_events'],1)
+            self.assertEqual(len(restarted.store.alerts()),1)
+            recovered_at=self.end+timedelta(minutes=2)
+            self.assertTrue(restarted.scan_cycle(recovered_at)['ok'])
+            self.assertEqual(len(restarted.store.jobs()),3)
+            self.assertEqual(restarted.store.alerts(),[])
+            self.assertEqual(restarted.store.source_state(source.name)['cutoff'],recovered_at.isoformat())
+            self.assertEqual([m['source'] for m in restarted.archive.manifests()],[source.name])
+
+    def test_recovery_certifies_all_days_or_leaves_coverage_incomplete(self):
+        self.client.get.side_effect=[self.page(self.row(1,20)),self.page(self.row(2,19))]
+        source=TitleSearchSource(self.client)
+        result=source.recover(self.start,self.end)
+        self.assertTrue(result.complete)
+        self.assertEqual(result.source,source.name)
+        self.assertEqual({row.source_id for row in result.events},{'1','2'})
+        dates=[parse_qs(urlsplit(call.args[0]).query) for call in self.client.get.call_args_list]
+        self.assertEqual([query['fromDate'] for query in dates],[['20261120'],['20261119']])
+        self.assertEqual([query['toDate'] for query in dates],[['20261120'],['20261119']])
+
+        self.client.get.side_effect=[self.page(self.row(1,19)),self.page(self.row(2,19))]
+        result=source.recover(self.start,self.end)
+        self.assertFalse(result.complete)
+        self.assertEqual([row.source_id for row in result.events],['2'])
+        self.assertIn('outside requested recovery day',result.evidence)
+
+        self.client.reset_mock()
+        self.client.get.side_effect=[self.page()]*4
+        result=source.recover(self.start-timedelta(days=7),self.end)
+        self.assertFalse(result.complete)
+        self.assertEqual(self.client.get.call_count,4)
+
+    def test_backup_runs_before_recovery_and_rate_limit_is_retained(self):
+        backup=Mock()
+        backup.name='new-listings-main-board'
+        backup.fetch.return_value=SourceResult(backup.name,[])
+        def limited(url):
+            backup.fetch.assert_called_once()
+            raise SourceError('rate limited',retry_after=600)
+        def primary(url):
+            if self.client.get.call_count==1:
+                return 'not JSON'
+            return limited(url)
+        self.client.get.side_effect=primary
+        with tempfile.TemporaryDirectory() as root:
+            store=StateStore(Path(root)/'state.sqlite3')
+            monitor=Monitor(store,[TitleSearchSource(self.client),backup])
+            result=monitor.scan(self.end)
+            self.assertFalse(result['ok'])
+            self.assertTrue(result['sources'][1]['ok'])
+            self.assertEqual(result['sources'][0]['recovery']['error'],'rate limited')
+            self.assertTrue(monitor.scan(self.end+timedelta(minutes=1))['sources'][0]['deferred'])
+            self.assertEqual(self.client.get.call_count,2)
+            self.assertEqual(backup.fetch.call_count,2)

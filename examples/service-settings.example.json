@@ -26,5 +26,7 @@
     "offer",
     "allotment"
   ],
-  "grey_state_db": "data/grey/grey.sqlite3"
+  "grey_state_db": "data/grey/grey.sqlite3",
+  "offer_notice_config": null,
+  "offer_notice_enabled_since": null
 }

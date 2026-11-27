@@ -98,8 +98,9 @@ class SnapshotArchive:
         if format=='legacy_aggregate' and not (aggregate and self.allow_legacy_replay):raise SourceError('legacy snapshot replay not enabled')
         if format not in {'html','json','legacy_aggregate'}:raise SourceError('snapshot format rejected')
         return url
-    def save_result(self,result):
-        if not result.complete or not result.responses:raise SourceError('complete raw response audit required')
+    def save_result(self,result,*,allow_partial=False):
+        if (not result.complete and not allow_partial) or not result.responses:
+            raise SourceError('complete raw response audit required')
         records=[]
         for response in result.responses:
             format=response['format'];url=self._url(response['url'],format);raw=response['body'];stored=_sanitize(raw,format)
@@ -108,7 +109,7 @@ class SnapshotArchive:
             if not path.is_file() or _hash(path.read_bytes())!=stored_sha:private_write(path,stored.encode())
             records.append({'url':url,'format':format,'path':str(path),'original_sha256':original_sha,'sha256':stored_sha,'sanitized':original_sha!=stored_sha,'captured_at':_now().isoformat()})
         safe_name=_hash(result.source.encode())[:20]
-        manifest={'source':result.source,'complete':True,'count':result.count,'parse_audit':result.evidence,'responses':records,'saved_at':_now().isoformat()}
+        manifest={'source':result.source,'complete':result.complete,'count':result.count,'parse_audit':result.evidence,'responses':records,'saved_at':_now().isoformat()}
         write_json(self.root/'latest'/(safe_name+'.json'),manifest)
         return records
     def manifests(self):
@@ -138,8 +139,24 @@ class _AuditedSource:
     def __init__(self,source,archive):self.source=source;self.archive=archive;self.name=source.name;self.timestamp_precision=getattr(source,'timestamp_precision',None)
     def fetch(self,start,end):
         result=self.source.fetch(start,end)
-        self.archive.save_result(result) # before Monitor commits successful cutoff
+        self._save(result) # before Monitor commits successful cutoff
         return result
+    def recover(self,start,end):
+        if not callable(getattr(type(self.source),'recover',None)):
+            raise SourceError('source has no daily recovery')
+        result=self.source.recover(start,end)
+        self._save(result,allow_partial=True)
+        return result
+    def _save(self,result,*,allow_partial=False):
+        recovery_name=getattr(type(self.source),'recovery_name',None)
+        if not result.complete and (not allow_partial or not recovery_name or result.source!=recovery_name):
+            raise SourceError('unverified recovery audit')
+        self.archive.save_result(result,allow_partial=allow_partial)
+        if result.complete and recovery_name:
+            # Retire the evidence pointer after complete replay. Content-addressed
+            # response bodies remain available for existing audit references.
+            name=_hash(recovery_name.encode())[:20]
+            (self.archive.root/'latest'/(name+'.json')).unlink(missing_ok=True)
 
 @dataclass
 class ServiceSettings:
@@ -158,9 +175,13 @@ class ServiceSettings:
     author_inputs: dict = field(default_factory=dict)
     auto_article_kinds: tuple = ('offer','allotment')
     grey_state_db: str|None = None
+    offer_notice_config: str|None = None
+    offer_notice_enabled_since: str|None = None
     def __post_init__(self):
         if self.scan_seconds<1 or self.aggregate_seconds<1 or self.overlap_hours<0 or self.initial_days<1:raise ValueError('Invalid service timing')
         if not 1<=self.max_classification_groups<=100 or not 1<=self.max_worker_groups<=100:raise ValueError('Unbounded service batch')
+        if self.offer_notice_config and (not self.offer_notice_enabled_since or datetime.fromisoformat(self.offer_notice_enabled_since).tzinfo is None):
+            raise ValueError('Offer notices require an activation timestamp with a timezone')
 
 class LocalService:
     def __init__(self,settings,sources=None,downloader=None,worker=None,process_factory=None):
@@ -173,6 +194,8 @@ class LocalService:
         self.worker=worker
         self.process_factory=process_factory or multiprocessing.get_context('spawn').Process
         self._process=None
+        self._writer_process=None
+        self._notice_process=None
     def _state(self,part='scan'):
         path=self.root/(part+'-state.json')
         try:return json.loads(path.read_text())
@@ -284,15 +307,19 @@ class LocalService:
         components={p.stem:json.loads(p.read_text()) for p in (self.root/'health-components').glob('*.json')}
         pipeline=self._state('classification')
         health={'at':_now().isoformat(),'alerts':self.store.alerts(),'external_delivery_enabled':False,'writer_enabled':self.settings.enable_writer,'components':components,'download_failures':pipeline.get('download_failures',{})}
+        health['offer_notice_email_enabled']=bool(self.settings.offer_notice_config)
         classification=components.get('classification',{}).get('result',{})
+        notice=components.get('offer_notices',{}).get('result',{})
         health['pipeline_process_alive']=bool(self._process is not None and self._process.is_alive())
         with self.store.connect() as c:
             c.execute('BEGIN IMMEDIATE');self.store._worker_schema(c)
             attention=[dict(r) for r in c.execute("SELECT j.event_id,j.status,j.reason,j.updated_at FROM jobs j WHERE j.status IN ('blocked','failed')")]
+            recovery=[dict(r) for r in c.execute("SELECT event_id,status,reason,retry_after FROM jobs WHERE status IN ('waiting_sources','awaiting_source') OR (status='pending' AND reason IS NOT NULL AND retry_after IS NOT NULL) ORDER BY retry_after,event_id")]
             counts={r['status']:r['count'] for r in c.execute('SELECT status,COUNT(*) AS count FROM jobs GROUP BY status')}
         health['queue_counts']=counts
         health['queue_attention']=attention
-        health['ok']=not health['alerts'] and not classification.get('snapshot_errors') and not health['download_failures'] and not attention
+        health['queue_recovery']=recovery
+        health['ok']=not health['alerts'] and not classification.get('snapshot_errors') and not health['download_failures'] and not attention and not notice.get('attention')
         write_json(self.root/'health.json',health);return health
     def cycle(self,scan=True,classify=False,work=False,now=None):
         # Scan and pipeline have different locks, so a slow writer never owns the
@@ -302,19 +329,30 @@ class LocalService:
             with singleton_lock(self.root/'locks/scan.lock') as acquired:
                 if acquired:result['scan']=self.scan_cycle(now)
                 else:result['scan']={'status':'busy'}
-        if classify or work:
+        if classify:
             with singleton_lock(self.root/'locks/pipeline.lock') as acquired:
-                if acquired:
-                    if classify:result['classification']=self.classify_cycle(now)
-                    if work:result['work']=self.work_cycle()
+                if acquired:result['classification']=self.classify_cycle(now)
                 else:result['pipeline']={'status':'busy'}
+        if work:
+            with singleton_lock(self.root/'locks/writer.lock') as acquired:
+                if acquired:result['work']=self.work_cycle()
+                else:result['work']={'status':'busy'}
         result['health']=self._health({k:v for k,v in result.items()})
         return result
     def dispatch_pipeline(self):
-        if self._process is not None and self._process.is_alive():return {'status':'already_running'}
-        if self._process is not None:self._process.join(timeout=0)
-        self._process=self.process_factory(target=_pipeline_process,args=(asdict(self.settings),),daemon=False)
-        self._process.start();return {'status':'started'}
+        def start(attribute,target):
+            current=getattr(self,attribute)
+            if current is not None and current.is_alive():return 'already_running'
+            if current is not None:current.join(timeout=0)
+            process=self.process_factory(target=target,args=(asdict(self.settings),),daemon=False)
+            setattr(self,attribute,process)
+            process.start()
+            return 'started'
+
+        result={'status':start('_process',_pipeline_process)}
+        if self.settings.enable_writer:result['writer']=start('_writer_process',_writer_process)
+        if self.settings.offer_notice_config:result['offer_notices']=start('_notice_process',_offer_notice_process)
+        return result
     def run_loop(self,stop,max_cycles=None,dispatch=True):
         count=0
         with singleton_lock(self.root/'locks/monitor-loop.lock') as acquired:
@@ -330,4 +368,23 @@ class LocalService:
 
 def _pipeline_process(settings):
     service=LocalService(settings)
-    service.cycle(scan=False,classify=True,work=service.settings.enable_writer)
+    service.cycle(scan=False,classify=True)
+
+
+def _writer_process(settings):
+    LocalService(settings).cycle(scan=False,work=True)
+
+
+def _offer_notice_process(settings):
+    from .offer_notice import OfferNotices
+
+    service=LocalService(settings)
+    with singleton_lock(service.root/'locks/offer-notices.lock') as acquired:
+        if not acquired:return
+        try:
+            notice=OfferNotices(service.store,service.root/'classification',service.settings.offer_notice_config,
+                                datetime.fromisoformat(service.settings.offer_notice_enabled_since))
+            result=notice.cycle()
+        except Exception:
+            result={'attention':['offer_notice_cycle_failed'],'results':[]}
+        service._health({'offer_notices':result})

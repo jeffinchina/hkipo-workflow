@@ -52,6 +52,33 @@ class WorkerTests(unittest.TestCase):
         self.assertIsNotNone(row['retry_after']);self.assertIsNone(self.store.claim_job_group('early'))
         self.assertEqual(self.store.research_run('revision')['status'],'revision_pending')
         self.assertEqual(self.store.finish_research_claim(claim['token'],'revision',{},'ready_for_delivery'),0)
+
+    def test_missing_source_rechecks_without_rewriting_until_official_hash_changes(self):
+        e=event(1,kind='allotment');self.store.ingest([e]);self.confirm(e,'allotment')
+        original=pdf_bytes();self.downloader.fetcher=lambda u:(original,u)
+        self.writer.return_value={'status':'needs_source','reason':'authoritative_source_unresolved'}
+        first=self.worker.run_one()
+        self.assertEqual(first['status'],'awaiting_source')
+        self.assertEqual(self.worker.run_one()['status'],'idle')
+        for _ in range(4):
+            with self.store.connect() as c:c.execute('UPDATE jobs SET retry_after=NULL')
+            self.assertEqual(self.worker.run_one()['status'],'awaiting_source')
+        self.writer.assert_called_once()
+        self.assertEqual(self.store.jobs()[0]['attempts'],0)
+        self.downloader.fetcher=lambda u:(pdf_bytes('updated official timetable'),u)
+        self.writer.return_value={'status':'ready_for_delivery'}
+        with self.store.connect() as c:c.execute('UPDATE jobs SET retry_after=NULL')
+        revised=self.worker.run_one()
+        self.assertEqual(revised['status'],'ready_for_delivery')
+        self.assertNotEqual(first['research_id'],revised['research_id'])
+
+    def test_new_document_wakes_waiting_episode_before_scheduled_recheck(self):
+        a,p=event(1),event(2);self.store.ingest([a,p]);self.confirm(a,'announcement');self.confirm(p,'prospectus')
+        self.writer.side_effect=[{'status':'needs_source'},{'status':'ready_for_delivery'}]
+        self.assertEqual(self.worker.run_one()['status'],'awaiting_source')
+        extra=event(3);self.store.ingest([extra]);self.confirm(extra,'announcement')
+        self.assertEqual(self.worker.run_one()['status'],'ready_for_delivery')
+        self.assertEqual(len(self.store.jobs('ready_for_delivery')),3)
     def test_expired_lease_recovery_fencing_and_retry_bound(self):
         e=event(1);self.store.ingest([e]);self.confirm(e,'announcement');now=datetime.now(timezone.utc)
         one=self.store.claim_job_group('one',lease_seconds=1,max_attempts=2,now=now)
@@ -125,6 +152,7 @@ class WorkerTests(unittest.TestCase):
         first=self.worker.run_one();self.store.set_job_status(e.event_id,'pending')
         self.downloader.fetcher=lambda u:(pdf_bytes('changed source'),u)
         second=self.worker.run_one();self.assertNotEqual(first['research_id'],second['research_id']);self.assertEqual(first['logical_event_id'],second['logical_event_id']);self.assertEqual(self.writer.call_count,2)
+        self.assertEqual(self.store.research_run(first['research_id'])['status'],'superseded')
         self.assertEqual(len(self.downloader.history(e.url)),2)
     def test_different_offer_episodes_do_not_merge(self):
         events=[event(n) for n in range(1,5)];self.store.ingest(events)
@@ -141,8 +169,11 @@ class WorkerTests(unittest.TestCase):
         from hkipo.downloads import DownloadError
         e=event(1,kind='allotment');self.store.ingest([e]);self.confirm(e,'allotment')
         self.downloader.download=Mock(side_effect=DownloadError('http_429_retry_later',retry_after=600))
-        before=datetime.now(timezone.utc);self.assertEqual(self.worker.run_one()['status'],'failed')
+        before=datetime.now(timezone.utc);self.assertEqual(self.worker.run_one()['status'],'awaiting_source')
         retry=datetime.fromisoformat(self.store.jobs()[0]['retry_after']);self.assertGreaterEqual((retry-before).total_seconds(),600)
+        new=event(2,kind='allotment');self.store.ingest([new]);self.confirm(new,'allotment')
+        self.assertEqual(self.worker.run_one()['status'],'idle')
+        self.downloader.download.assert_called_once()
     def test_lease_loss_after_writer_does_not_mark_ready(self):
         e=event(1,kind='allotment');self.store.ingest([e]);self.confirm(e,'allotment')
         def writer(**options):

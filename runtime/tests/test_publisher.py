@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import Mock
 from hkipo.publisher import Publisher, PublisherSettings
 from hkipo.quota import QuotaDeferred
+from hkipo.release_worker import RenderUnavailable
 
 
 class PublisherTests(unittest.TestCase):
@@ -94,6 +95,26 @@ class PublisherTests(unittest.TestCase):
         health=self.publisher.cycle()
         self.assertEqual(health['status'],'needs_attention');self.assertFalse(health['ok'])
         self.assertEqual(health['attention'][0]['status'],'needs_attention')
+
+    def test_renderer_outage_retries_same_job_and_does_not_block_other_issue(self):
+        first=self.add(1);self.add(2);self.enable()
+        self.preparer.side_effect=[RenderUnavailable([('office','RuntimeError')]),
+                                   self.prepare(self.research/f'{2:064x}'),self.prepare(self.research/first)]
+        cycle=self.publisher.cycle()
+        self.assertEqual([r['status'] for r in cycle['results']],['deferred','delivered'])
+        self.assertEqual(cycle['recovery'][0]['reason'],'word_render_unavailable')
+        self.assertEqual(self.publisher.cycle()['results'],[])
+        with self.publisher.store.connect() as c:c.execute('UPDATE publication_runs SET retry_at=0 WHERE research_id=?',(first,))
+        self.assertEqual(self.publisher.cycle()['results'][0]['status'],'delivered')
+        self.assertEqual(self.sender.email.call_count,2)
+
+    def test_draft_preflight_retries_without_resending_confirmed_email(self):
+        rid=self.add(1);self.enable()
+        self.sender.email.side_effect=[{'status':'confirmed'},{'status':'already_confirmed'}]
+        self.sender.draft.side_effect=[{'status':'retryable'},{'status':'confirmed'}]
+        self.assertEqual(self.publisher.cycle()['results'][0]['reason'],'delivery_preflight_retry')
+        with self.publisher.store.connect() as c:c.execute('UPDATE publication_runs SET retry_at=0 WHERE research_id=?',(rid,))
+        self.assertEqual(self.publisher.cycle()['results'][0]['status'],'delivered')
 
     def test_verified_quota_deferral_persists_retry_and_stops_cycle(self):
         first = self.add(1); self.add(2)

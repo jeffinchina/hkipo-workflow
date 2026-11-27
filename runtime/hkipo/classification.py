@@ -11,8 +11,8 @@ from pathlib import Path
 import re
 import unicodedata
 from urllib.parse import urljoin
-from .downloads import official_url
-from .sources import TableParser, title_row_excluded
+from .downloads import DownloadError, official_url
+from .sources import TableParser, parse_title_row
 
 
 def compact(text):return re.sub(r'\s+','',unicodedata.normalize('NFKC',text))
@@ -53,9 +53,16 @@ def aggregate_evidence(html,source_url):
 def title_evidence(raw,source_url='https://www1.hkexnews.hk/search/titleSearchServlet.do'):
     if source_url!='https://www1.hkexnews.hk/search/titleSearchServlet.do':raise ValueError('Unverified title source')
     payload=json.loads(raw);rows=json.loads(payload['result']) if isinstance(payload['result'],str) else payload['result']
+    if not isinstance(rows,list):raise ValueError('Official title result rows missing')
     sha=hashlib.sha256(raw.encode()).hexdigest();out=[]
     for row in rows:
-        if title_row_excluded(row):continue
+        try:
+            events,_=parse_title_row(row)
+        except (ValueError,TypeError,KeyError,AttributeError):
+            # A verified recovery page may contain an explicitly quarantined
+            # row. It must not establish document roles for any source.
+            continue
+        if not events:continue
         # LONG_TEXT is the official headline category, never guessed from the
         # document title (warrants also contain the words listing document).
         category=compact(row.get('LONG_TEXT',''))
@@ -66,12 +73,11 @@ def title_evidence(raw,source_url='https://www1.hkexnews.hk/search/titleSearchSe
         elif re.search('配發結果|AllotmentResults',category,re.I):role='allotment'
         elif re.search('公告及通告|AnnouncementsandNotices',category,re.I) and re.search(r'全球發售|全球发售|global offering',row.get('TITLE',''),re.I) and re.search(r'延遲|延期|終止|取消|補充|更正|delay|postpon|cancel|supplement|correction',row.get('TITLE',''),re.I):role='exception'
         else:continue
-        codes=re.split(r'<br\s*/?>',row['STOCK_CODE'],flags=re.I);names=re.split(r'<br\s*/?>',row['STOCK_NAME'],flags=re.I)
-        if len(codes)!=len(names):continue
-        url=official_url(urljoin('https://www1.hkexnews.hk',row['FILE_LINK']))
-        day=datetime.strptime(row['DATE_TIME'],'%d/%m/%Y %H:%M').date().isoformat()
-        for code,name in zip(codes,names):
-            if re.fullmatch(r'\d{1,5}',code):out.append(OfficialDocumentEvidence(url,code.zfill(5),name,role,category,source_url,sha,'NEWS_ID:'+str(row['NEWS_ID']),day))
+        try:url=official_url(events[0].url)
+        except (DownloadError,ValueError):continue
+        for event in events:
+            out.append(OfficialDocumentEvidence(url,event.stock_code,event.stock_name,role,category,source_url,sha,
+                                                'NEWS_ID:'+event.source_id,event.published_at[:10]))
     return out
 
 

@@ -1,6 +1,6 @@
 """Official HKEX read-only sources with bounded transport and completeness gates."""
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from email.utils import parsedate_to_datetime
 from html import unescape
@@ -17,6 +17,12 @@ class SourceError(RuntimeError):
     def __init__(self,message,retry_after=None):
         super().__init__(message)
         self.retry_after=retry_after
+
+class TitleDataError(SourceError):
+    """A title-search response failed a data check; smaller queries may recover it."""
+
+class _ResponseTooLarge(SourceError):
+    pass
 
 class _OfficialRedirect(HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -38,7 +44,7 @@ class HttpClient:
                     canonical_url(response.geturl())
                     raw=response.read(15_000_001)
                     if len(raw)>15_000_000:
-                        raise SourceError('response too large')
+                        raise _ResponseTooLarge('response too large')
                     return raw.decode('utf-8-sig')
             except HTTPError as e:
                 if e.code not in {429,500,502,503,504}:
@@ -171,39 +177,95 @@ def title_row_exclusion(row):
     return None
 
 
-def title_row_excluded(row):
-    return title_row_exclusion(row) is not None
-
-
-def parse_title_json(raw,source='title-search',exclusions=None):
+def _title_rows(raw):
     try:
         data=json.loads(raw)
         rows=json.loads(data['result']) if isinstance(data['result'],str) else data['result']
-        total=int(data['recordCnt']);loaded=int(data['loadedRecord'])
-        more=data['hasNextRow']
-        if not isinstance(more,bool) or not isinstance(rows,list) or loaded!=len(rows) or loaded>total or total<0:
+        counts=(data['recordCnt'],data['loadedRecord'])
+        if any(not re.fullmatch(r'[0-9]{1,12}',str(count)) for count in counts):
             raise ValueError()
-        events=[];excluded=[]
-        for row in rows:
-            required={'NEWS_ID','STOCK_CODE','STOCK_NAME','TITLE','FILE_LINK','DATE_TIME'}
-            if not required.issubset(row):raise ValueError()
-            url=canonical_url(urljoin('https://www1.hkexnews.hk',row['FILE_LINK']))
-            published=datetime.strptime(row['DATE_TIME'],'%d/%m/%Y %H:%M').isoformat()+'+08:00'
-            reason = title_row_exclusion(row)
-            if reason:
-                excluded.append({'NEWS_ID': str(row['NEWS_ID']), 'reason': reason})
-                continue
-            codes=re.split(r'<br\s*/?>',str(row['STOCK_CODE']).strip(),flags=re.I)
-            names=re.split(r'<br\s*/?>',str(row['STOCK_NAME']).strip(),flags=re.I)
-            if len(codes)!=len(names) or any(not re.fullmatch(r'\d{1,5}',c.strip()) for c in codes) or any(not n.strip() for n in names):raise ValueError()
-            for code,name in zip(codes,names):
-                events.append(make_event(source,row['NEWS_ID'],code.strip(),unescape(name),unescape(row['TITLE']),url,published,unescape(row.get('LONG_TEXT',''))))
-        if more != (loaded<total):raise ValueError()
-        if len({x['NEWS_ID'] for x in excluded})!=len(excluded):raise ValueError()
-        if exclusions is not None:exclusions.extend(excluded)
-        return events,total,more
+        total,loaded=map(int,counts)
+        more=data['hasNextRow']
+        if (not isinstance(more,bool) or not isinstance(rows,list) or loaded!=len(rows)
+                or loaded>total or more!=(loaded<total)):
+            raise ValueError()
+        ids=[_title_row_id(row) for row in rows]
+        if len(set(ids))!=len(ids):
+            raise TitleDataError('title-search duplicate or unstable pagination')
+        return rows,ids,total,more
     except (ValueError,TypeError,KeyError,OverflowError):
-        raise SourceError('title-search JSON schema or counts invalid') from None
+        raise TitleDataError('title-search JSON schema or counts invalid') from None
+
+
+def _title_row_id(row):
+    if not isinstance(row,dict) or not re.fullmatch(r'[0-9]{1,24}',str(row.get('NEWS_ID',''))):
+        raise ValueError('invalid title row ID')
+    return str(row['NEWS_ID'])
+
+
+def parse_title_row(row,source='title-search'):
+    """Validate the whole security association before emitting any of its events."""
+    row_id=_title_row_id(row)
+    url=canonical_url(urljoin('https://www1.hkexnews.hk',row['FILE_LINK']))
+    published=datetime.strptime(row['DATE_TIME'],'%d/%m/%Y %H:%M').isoformat()+'+08:00'
+    title=unescape(row['TITLE'])
+    category=unescape(row.get('LONG_TEXT',''))
+    if not row['FILE_LINK'] or not title.strip():
+        raise ValueError('missing title or link')
+    reason=title_row_exclusion(row)
+    if reason:
+        return [], {'NEWS_ID':row_id,'reason':reason}
+    codes=re.split(r'<br\s*/?>',str(row['STOCK_CODE']),flags=re.I)
+    names=[unescape(name).strip() for name in re.split(r'<br\s*/?>',row['STOCK_NAME'],flags=re.I)]
+    if (len(codes)!=len(names) or any(not re.fullmatch(r'[0-9]{1,5}',c.strip()) for c in codes)
+            or not all(names)):
+        raise ValueError('invalid stock code and name association')
+    return [make_event(source,row_id,code.strip(),name,title,url,published,category)
+            for code,name in zip(codes,names)], None
+
+
+def _parse_title_rows(rows,ids,source,day=None):
+    events=[];exclusions=[];invalid=[]
+    for row,row_id in zip(rows,ids):
+        try:
+            row_events,exclusion=parse_title_row(row,source)
+        except (ValueError,TypeError,KeyError,AttributeError):
+            if day is None:
+                raise TitleDataError('title-search JSON schema or counts invalid') from None
+            invalid.append(row_id)
+            continue
+        if day is not None and datetime.strptime(row['DATE_TIME'],'%d/%m/%Y %H:%M').date()!=day:
+            raise TitleDataError('title-search returned rows outside requested recovery day')
+        events.extend(row_events)
+        if exclusion:
+            exclusions.append(exclusion)
+    return events,exclusions,invalid
+
+
+def parse_title_json(raw,source='title-search',exclusions=None):
+    rows,ids,total,more=_title_rows(raw)
+    events,excluded,_=_parse_title_rows(rows,ids,source)
+    if exclusions is not None:
+        exclusions.extend(excluded)
+    return events,total,more
+
+
+def _document_observations(events):
+    canonical={};aliases=[]
+    fields=('stock_name','title','url','stock_code','kind','version','language')
+    for event in events:
+        prior=canonical.get(event.event_id)
+        if prior is None:
+            canonical[event.event_id]=event
+            continue
+        if prior.source_id==event.source_id or any(getattr(prior,k)!=getattr(event,k) for k in fields):
+            raise TitleDataError('title-search conflicting document observations')
+        aliases.append({'event_id':event.event_id,'NEWS_IDs':[prior.source_id,event.source_id],
+                        'published_at':[prior.published_at,event.published_at],
+                        'reason':'distinct official publication rows for identical document association'})
+        if event.published_at<prior.published_at:
+            canonical[event.event_id]=event
+    return list(canonical.values()),aliases
 
 class TitleSearchSource:
     """Official cumulative rowRange pagination. No assumption that first 100
@@ -211,58 +273,93 @@ class TitleSearchSource:
     Any truncated/unstable result fails the whole scan."""
     name='title-search'
     timestamp_precision='minute'
+    recovery_name='title-search-recovery'
+    exchange_zone=ZoneInfo('Asia/Hong_Kong')
     def __init__(self,client=None,page_size=100,max_records=20000):
         self.client=client or HttpClient();self.page_size=page_size;self.max_records=max_records
         if page_size<1 or max_records<page_size:raise ValueError('Invalid pagination bounds')
     def fetch(self,start,end):
+        return self._fetch_dates(start.astimezone(self.exchange_zone).date(),
+                                 end.astimezone(self.exchange_zone).date())
+
+    def recover(self,start,end):
+        """Recover intact rows without crossing an unresolved gap in coverage."""
+        first=start.astimezone(self.exchange_zone).date()
+        last=end.astimezone(self.exchange_zone).date()
+        span=(last-first).days+1
+        # Follow current publications and recheck the oldest gap even when a
+        # prolonged outage makes a complete replay too expensive this cycle.
+        offsets=range(span-1,-1,-1) if span<=4 else (span-1,span-2,0,1)
+        parts=[]
+        notes=[]
+        row_ids=set()
+        for offset in offsets:
+            day=first+timedelta(days=offset)
+            try:
+                part=self._fetch_dates(day,day,recovery=True)
+            except TitleDataError as error:
+                notes.append(f'{day}: {error}')
+                continue
+            except SourceError as error:
+                if error.retry_after is not None:
+                    raise
+                notes.append(f'{day}: {error}')
+                break
+            _,ids,_,_=_title_rows(part.responses[-1]['body'])
+            if row_ids.intersection(ids):
+                raise TitleDataError('title-search recovery days contain duplicate NEWS_ID')
+            row_ids.update(ids)
+            parts.append(part)
+        if not parts:
+            raise TitleDataError('title-search daily recovery returned no auditable results')
+        events,aliases=_document_observations(event for part in parts for event in part.events)
+        complete=len(parts)==span and all(part.complete for part in parts)
+        audit={'certified_full_range':complete,'requested_days':[str(first),str(last)],
+               'partitions':[part.evidence for part in parts],'failed_partitions':notes,
+               'republication_aliases':aliases}
+        return SourceResult(self.name if complete else self.recovery_name,events,complete,
+                            sum(part.count for part in parts),json.dumps(audit,ensure_ascii=False),
+                            [response for part in parts for response in part.responses])
+
+    def _fetch_dates(self,first,last,recovery=False):
         previous_ids=set();previous_rows={};previous_total=None;responses=[]
         limit=self.page_size
         for attempt in range(2):
-            params={'sortDir':'0','sortByOptions':'DateTime','category':'0','market':'SEHK','stockId':'-1','documentType':'-2','fromDate':start.astimezone(ZoneInfo('Asia/Hong_Kong')).strftime('%Y%m%d'),'toDate':end.astimezone(ZoneInfo('Asia/Hong_Kong')).strftime('%Y%m%d'),'title':'','searchType':'0','t1code':'-2','t2Gcode':'-2','t2code':'-2','rowRange':limit,'lang':'zh'}
+            params={'sortDir':'0','sortByOptions':'DateTime','category':'0','market':'SEHK','stockId':'-1','documentType':'-2','fromDate':first.strftime('%Y%m%d'),'toDate':last.strftime('%Y%m%d'),'title':'','searchType':'0','t1code':'-2','t2Gcode':'-2','t2code':'-2','rowRange':limit,'lang':'zh'}
             request_url='https://www1.hkexnews.hk/search/titleSearchServlet.do?'+urlencode(params)
-            raw=self.client.get(request_url)
-            exclusions=[]
-            events,total,more=parse_title_json(raw,self.name,exclusions)
+            try:
+                raw=self.client.get(request_url)
+            except _ResponseTooLarge:
+                raise TitleDataError('title-search response too large') from None
+            rows,row_ids,total,more=_title_rows(raw)
             responses.append({'url':request_url,'format':'json','body':raw})
             if total>self.max_records:
-                raise SourceError('title-search pagination limit exceeded')
+                raise TitleDataError('title-search pagination limit exceeded')
             # NEWS_ID identifies a source row, while event_id identifies a
             # document/security. HKEX can legitimately republish the same PDF
             # under a new NEWS_ID and later time. Validate pagination at the raw
             # row boundary, so such aliases neither stop all monitoring nor hide
             # a missing row behind an identical document URL.
-            envelope=json.loads(raw)
-            rows=json.loads(envelope['result']) if isinstance(envelope['result'],str) else envelope['result']
-            ids={str(row['NEWS_ID']) for row in rows}
-            if len(ids)!=len(rows) or not previous_ids.issubset(ids) or (more and ids==previous_ids):
-                raise SourceError('title-search duplicate or unstable pagination')
-            current_rows={str(row['NEWS_ID']):row for row in rows}
+            ids=set(row_ids)
+            if not previous_ids.issubset(ids) or (more and ids==previous_ids):
+                raise TitleDataError('title-search duplicate or unstable pagination')
+            current_rows=dict(zip(row_ids,rows))
             if any(current_rows[key]!=row for key,row in previous_rows.items()):
-                raise SourceError('title-search prefix observations changed during pagination')
-            canonical={};aliases=[]
-            for event in events:
-                prior=canonical.get(event.event_id)
-                if prior is None:
-                    canonical[event.event_id]=event;continue
-                # Distinct source IDs alone are not enough: differing names or
-                # headlines at one canonical identity remain an actual conflict.
-                fields=('stock_name','title','url','stock_code','kind','version','language')
-                if prior.source_id==event.source_id or any(getattr(prior,k)!=getattr(event,k) for k in fields):
-                    raise SourceError('title-search conflicting document observations')
-                aliases.append({'event_id':event.event_id,'NEWS_IDs':[prior.source_id,event.source_id],
-                                'published_at':[prior.published_at,event.published_at],
-                                'reason':'distinct official publication rows for identical document association'})
-                if event.published_at<prior.published_at:canonical[event.event_id]=event
+                raise TitleDataError('title-search prefix observations changed during pagination')
+            events,exclusions,invalid=_parse_title_rows(rows,row_ids,self.name,first if recovery else None)
+            canonical,aliases=_document_observations(events)
             # Publication can arrive while fetching; require stable totals before
             # committing a cumulative last page. A later poll recovers overlap.
             if previous_total is not None and total!=previous_total:
-                raise SourceError('title-search changed during pagination')
+                raise TitleDataError('title-search changed during pagination')
             if not more:
                 audit='official cumulative JSON; raw NEWS_ID total and prefix verified'
                 if exclusions:audit+='; exclusions='+json.dumps(exclusions,ensure_ascii=False)
                 if aliases:audit+='; republication_aliases='+json.dumps(aliases,ensure_ascii=False)
-                return SourceResult(self.name,list(canonical.values()),True,total,audit,responses)
+                if recovery:audit=f'{first}: '+audit
+                if invalid:audit+='; quarantined NEWS_IDs='+json.dumps(invalid)
+                return SourceResult(self.name,canonical,not invalid,total,audit,responses)
             previous_ids,previous_total=ids,total
             previous_rows=current_rows
             limit=min(self.max_records,((total+self.page_size-1)//self.page_size)*self.page_size)
-        raise SourceError('title-search pagination limit exceeded')
+        raise TitleDataError('title-search pagination limit exceeded')

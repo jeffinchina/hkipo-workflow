@@ -1,10 +1,7 @@
 """Explicit, bounded Word release preparation. No delivery or import-time work."""
 import hashlib
-import sys
 import json
-import subprocess
 import os
-import signal
 import uuid
 import shutil
 from pathlib import Path
@@ -13,8 +10,26 @@ from .writer import save_json, fingerprint, run_codex, freeze_release, _job_lock
 from .render import word_render_environment, QR_PATH
 from .delivery import verify_release
 from .quota import quota_gate, QuotaUnavailable
+from .word_render import RenderUnavailable, pages as _pages, render_word_backends
 
-RENDER_SCRIPT = Path(__file__).resolve().parents[2] / 'scripts/render_docx.py'
+RUNTIME = Path.home() / '.cache/codex-runtimes/codex-primary-runtime/dependencies'
+DOCUMENTS_CACHE = Path.home() / '.codex/plugins/cache/openai-primary-runtime/documents'
+
+
+def _documents_renderer(cache=None):
+    cache = DOCUMENTS_CACHE if cache is None else Path(cache)
+    candidates = []
+    for version in cache.iterdir() if cache.is_dir() else ():
+        parts = version.name.split('.')
+        if len(parts) != 3 or any(not part.isascii() or not part.isdigit() for part in parts):
+            continue
+        script = version / 'skills/documents/render_docx.py'
+        if script.is_file():
+            candidates.append((tuple(map(int, parts)), script))
+    if not candidates:
+        raise RuntimeError('Bundled Word renderer unavailable')
+    return max(candidates)[1]
+
 SCHEMA = {'type': 'object', 'additionalProperties': False, 'required': ['pages'], 'properties': {
     'pages': {'type': 'array', 'items': {'type': 'object', 'additionalProperties': False,
         'required': ['page', 'pass', 'issues'], 'properties': {
@@ -32,9 +47,22 @@ def _sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
+def _page_pixels(pages):
+    from PIL import Image
+
+    hashes = []
+    for page in pages:
+        with Image.open(page) as image:
+            digest = hashlib.sha256(f'{image.width}x{image.height}:'.encode())
+            digest.update(image.convert('RGB').tobytes())
+            hashes.append(digest.hexdigest())
+    return hashes
+
+
 def _snapshot(job, status):
     paths = {job / 'status.json', job / 'sources/manifest.json', QR_PATH,
-             Path(__file__), Path(__file__).with_name('render.py')}
+             Path(__file__), Path(__file__).with_name('render.py'),
+             Path(__file__).with_name('word_render.py')}
     paths.update(p for p in job.glob('*.json') if p.name not in {'release.json'})
     for key in ('bundle_path', 'review_path', 'quality_path', 'visual_registry',
                 'scoped_visual_registry', 'scope_approval_registry'):
@@ -56,50 +84,37 @@ def _assert_current(job, status, snapshot):
         raise ValueError('Release inputs changed during preparation')
 
 
-def render_word(docx, destination, timeout=180):
-    """Use selected bundled Python/LibreOffice and child-only fonts; safe diagnostics."""
-    python = Path(sys.executable)
-    script = RENDER_SCRIPT
-    if not script.is_file():
-        raise RuntimeError('Standalone Word renderer unavailable')
-    destination.mkdir(parents=True, exist_ok=True)
-    child_env = word_render_environment(destination / 'environment')
-    with (destination / 'renderer.log').open('wb') as log:
-        proc = subprocess.Popen([str(python), str(script), str(docx), '--output_dir',
-            str(destination), '--emit_pdf'], env=child_env,
-            stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+def render_word(docx, destination, timeout=180, *, max_pages=20, exclude_engines=()):
+    """Try the Documents renderer and a direct, plug-in-free LibreOffice path."""
+    python = RUNTIME / 'python/bin/python3'
+    overrides = RUNTIME / 'bin/override'
+    wrapper = overrides / 'soffice'
+    bundled = (RUNTIME / 'native/libreoffice-headless/libreoffice/'
+               'LibreOfficeDev.app/Contents/MacOS/soffice')
+    managed = None
+    if python.is_file() and wrapper.is_file() and bundled.is_file():
         try:
-            proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, signal.SIGTERM)
-            try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                os.killpg(proc.pid, signal.SIGKILL)
-                proc.wait()
-            raise RuntimeError('Word renderer timed out; inspect local renderer.log') from None
-    if proc.returncode:
-        raise RuntimeError('Word renderer failed; inspect local renderer.log')
+            script = _documents_renderer()
+        except (OSError, RuntimeError):
+            pass
+        else:
+            managed = (str(bundled.resolve()), [str(python), str(script)])
+
+    def renderer_environment(directory):
+        env = word_render_environment(directory)
+        env['PATH'] = os.pathsep.join([str(overrides), str(RUNTIME / 'bin/fallback'),
+                                       env.get('PATH', '')])
+        return env
+
+    return render_word_backends(
+        docx, destination, environments=renderer_environment, managed=managed,
+        timeout=timeout, max_pages=max_pages, bundled=(bundled,), wrappers=(wrapper,),
+        exclude_engines=exclude_engines,
+    )
 
 
-def _pages(directory, max_pages):
-    from PIL import Image, ImageChops
-    files = list(directory.glob('page-*.png'))
-    try:
-        files.sort(key=lambda p: int(p.stem.split('-')[1]))
-    except ValueError:
-        raise ValueError('Invalid rendered page name') from None
-    if not 1 <= len(files) <= max_pages or [p.name for p in files] != [f'page-{n}.png' for n in range(1, len(files)+1)]:
-        raise ValueError('Missing or abnormal rendered page count')
-    for page in files:
-        with Image.open(page) as source:
-            source.load()
-            if source.format != 'PNG' or min(source.size) < 100:
-                raise ValueError('Invalid rendered PNG')
-            rgb = source.convert('RGB')
-            if ImageChops.difference(rgb, Image.new('RGB', rgb.size, 'white')).getbbox() is None:
-                raise ValueError('Blank rendered page')
-    return files
+class WordLayoutRejected(ValueError):
+    """A complete visual review found actual layout faults."""
 
 
 def _validate(result, expected):
@@ -112,7 +127,7 @@ def _validate(result, expected):
     if [p['page'] for p in pages] != expected:
         raise ValueError('Incomplete Word visual review coverage')
     if any(p['pass'] is not True or p['issues'] for p in pages):
-        raise ValueError('Word visual review failed; inspect local model audit')
+        raise WordLayoutRejected('Word visual review failed; inspect local model audit')
 
 
 @_job_locked
@@ -138,19 +153,57 @@ def prepare_release(job_dir, *, renderer=None, reviewer=None, quota=None,
                             'model': 'gpt-6.1-sol', 'effort': effort})
     work = job / 'release-preparation' / identity
     work.mkdir(parents=True, exist_ok=True)
-    attempts = list(work.glob('attempt-*'))
-    if len(attempts) >= max_attempts:
-        raise ValueError('Word preparation attempts exhausted; explicit repair required')
-    attempt = work / f'attempt-{len(attempts)+1}'
-    attempt.mkdir()
-    save_json(attempt / 'inputs.json', inputs)
-    output = Path(status['output_dir'])
-    renderer = renderer or render_word
-    reviewer = reviewer or run_codex
-    quota = quota or quota_gate
-    renderer(output / 'article.docx', attempt / 'pages')
+    while True:
+        attempts = sorted(work.glob('attempt-*'))
+        rejections = [json.loads(path.read_text()) for previous in attempts
+                      if (path := previous / 'layout-rejection.json').is_file()]
+        if len(attempts) >= max_attempts:
+            if rejections:
+                raise WordLayoutRejected('Word layout rejected; inspect local model audit')
+            raise ValueError('Word preparation attempts exhausted; explicit repair required')
+        attempt = work / f'attempt-{len(attempts)+1}'
+        attempt.mkdir()
+        save_json(attempt / 'inputs.json', inputs)
+
+        output = Path(status['output_dir'])
+        try:
+            if renderer is None:
+                selected = render_word(output / 'article.docx', attempt / 'pages',
+                    max_pages=max_pages, exclude_engines=tuple(
+                        rejection['engine'] for rejection in rejections if rejection.get('engine')))
+                save_json(attempt / 'renderer.json', selected)
+            else:
+                renderer(output / 'article.docx', attempt / 'pages')
+                selected = {}
+        except RenderUnavailable as error:
+            # No page set reached QA. Keep local diagnostics without using an
+            # attempt intended for evaluation of the document's actual layout.
+            save_json(attempt / 'render-failure.json', {'backends': error.failures})
+            attempt.rename(work / ('render-unavailable-' + uuid.uuid4().hex))
+            if rejections and not error.failures:
+                raise WordLayoutRejected('Word layout rejected and no alternate renderer available') from error
+            raise
+
+        pages = _pages(attempt / 'pages', max_pages)
+        pixels = _page_pixels(pages)
+        try:
+            if any(rejection['page_pixels'] == pixels for rejection in rejections):
+                raise WordLayoutRejected('Alternate renderer reproduced the rejected layout')
+            return _prepare_rendered_release(
+                job, status, inputs, identity, work, attempt, output, pages,
+                selected, reviewer or run_codex, quota or quota_gate, settings_path, effort,
+            )
+        except WordLayoutRejected:
+            save_json(attempt / 'layout-rejection.json', {
+                'engine': selected.get('engine'), 'page_pixels': pixels,
+            })
+            if renderer is not None or len(attempts) + 1 >= max_attempts:
+                raise
+
+
+def _prepare_rendered_release(job, status, inputs, identity, work, attempt, output,
+                              pages, selected, reviewer, quota, settings_path, effort):
     _assert_current(job, status, inputs)
-    pages = _pages(attempt / 'pages', max_pages)
     hashes = {str(p.resolve()): _sha(p) for p in pages}
     results = []
     def observe_quota():
@@ -198,7 +251,7 @@ def prepare_release(job_dir, *, renderer=None, reviewer=None, quota=None,
     save_json(qa, {'confirmed': True, 'docx_sha256': _sha(output / 'article.docx'),
         'input_fingerprint': identity, 'inputs_sha256': inputs, 'pages_sha256': hashes,
         'pages': results, 'model': 'gpt-6.1-sol', 'effort': effort,
-        'audit_dir': str(attempt), 'all_pages_visually_inspected': True})
+        'audit_dir': str(attempt), 'renderer': selected, 'all_pages_visually_inspected': True})
     release = freeze_release.__wrapped__(job)
     try:
         verify_release(release)

@@ -58,7 +58,7 @@ class StateStore:
         with self.connect() as c:
             return [json.loads(r['payload']) for r in c.execute('SELECT payload FROM events WHERE baseline=2')]
 
-    def commit_scan(self, source, events, cutoff, baseline=False, timestamp_precision=None):
+    def commit_scan(self, source, events, cutoff, baseline=False, timestamp_precision=None, *, partial=False):
         parsed = datetime.fromisoformat(cutoff)
         if parsed.tzinfo is None: raise ValueError("Timezone-aware cutoff required")
         parsed=parsed.astimezone(timezone.utc);cutoff=parsed.isoformat()
@@ -74,7 +74,7 @@ class StateStore:
             for event in events:
                 level=0
                 if baseline or initial_scan:level=1
-                elif first_source:
+                elif first_source or partial:
                     try:
                         published=datetime.fromisoformat(event.published_at)
                         if published.tzinfo is None:raise ValueError()
@@ -86,6 +86,10 @@ class StateStore:
                         else:level=0 if published>=anchor else 1
                     except ValueError:level=2
                 added.extend(self._ingest(c,[event],level,promote_candidates=(precision!='date')))
+            if partial:
+                # A vetted row can be durable while its source coverage is
+                # still incomplete. Leave the failure and cutoff untouched.
+                return added, bool(baseline or initial_scan)
             c.execute('''INSERT INTO sources(source,last_success,cutoff) VALUES(?,?,?)
               ON CONFLICT(source) DO UPDATE SET last_success=excluded.last_success,
               cutoff=CASE WHEN sources.cutoff IS NULL OR excluded.cutoff>sources.cutoff THEN excluded.cutoff ELSE sources.cutoff END,
@@ -135,6 +139,11 @@ class StateStore:
         with self.connect() as c:
             c.execute('UPDATE deliveries SET status=?,receipt=?,updated_at=? WHERE delivery_key=?',(status,json.dumps(receipt) if receipt is not None else None,utcnow(),delivery_key))
 
+    def release_unsent_delivery(self,delivery_key):
+        """Release an owned reservation only when transmission never began."""
+        with self.connect() as c:
+            return bool(c.execute("DELETE FROM deliveries WHERE delivery_key=? AND status='unknown'",(delivery_key,)).rowcount)
+
     def delivery(self,key):
         with self.connect() as c:
             r=c.execute('SELECT * FROM deliveries WHERE delivery_key=?',(key,)).fetchone()
@@ -180,32 +189,34 @@ class StateStore:
             # Lock waits must not consume a new lease or delay expiry recovery.
             current=now if now is not None else datetime.now(timezone.utc)
             stamp=current.astimezone(timezone.utc).isoformat();until=(current+timedelta(seconds=lease_seconds)).astimezone(timezone.utc).isoformat()
-            c.execute("UPDATE jobs SET status=CASE WHEN attempts>=? THEN 'blocked' ELSE 'pending' END,reason='lease_expired',claim_token=NULL,worker_id=NULL WHERE status='running' AND lease_until<=?",(max_attempts,stamp))
-            rows=c.execute("SELECT j.*,e.payload FROM jobs j JOIN events e USING(event_id) WHERE j.status IN ('pending','failed') AND j.attempts<? AND (j.retry_after IS NULL OR j.retry_after<=?) ORDER BY j.updated_at,j.event_id",(max_attempts,stamp)).fetchall()
+            c.execute("UPDATE jobs SET status=CASE WHEN reason IN ('authoritative_source_unresolved','official_download_retry','official_download_rate_limited') THEN 'awaiting_source' WHEN attempts>=? THEN 'blocked' ELSE 'pending' END,reason=CASE WHEN reason IN ('authoritative_source_unresolved','official_download_retry','official_download_rate_limited') THEN reason ELSE 'lease_expired' END,claim_token=NULL,worker_id=NULL WHERE status='running' AND lease_until<=?",(max_attempts,stamp))
+            rows=c.execute("SELECT j.*,e.payload FROM jobs j JOIN events e USING(event_id) WHERE ((j.status IN ('pending','failed') AND j.attempts<?) OR j.status='awaiting_source') AND (j.retry_after IS NULL OR j.retry_after<=?) ORDER BY j.updated_at,j.event_id",(max_attempts,stamp)).fetchall()
             classes={r['event_id']:dict(r) for r in c.execute('SELECT * FROM worker_classifications')}
             def groupkey(e):return (e['stock_code'],e['kind'],e['language'],classes.get(e['event_id'],{}).get('episode_id',e['event_id']))
-            running=c.execute("SELECT e.payload FROM jobs j JOIN events e USING(event_id) WHERE j.status='running' OR (j.status='pending' AND j.reason IN ('quota_reserve','quota_window_exhausted') AND j.retry_after>?)",(stamp,)).fetchall()
+            running=c.execute("SELECT e.payload FROM jobs j JOIN events e USING(event_id) WHERE j.status='running' OR (j.status IN ('pending','failed','awaiting_source') AND j.reason IN ('quota_reserve','quota_window_exhausted','official_download_rate_limited') AND j.retry_after>?)",(stamp,)).fetchall()
             busy={groupkey(json.loads(r['payload'])) for r in running}
             selected=None
             for row in rows:
                 e=json.loads(row['payload']);key=groupkey(e)
                 if key not in busy:selected=(key,row);break
             if selected is None:return None
-            key,_=selected;group=[]
-            waiting=c.execute("SELECT j.*,e.payload FROM jobs j JOIN events e USING(event_id) WHERE j.status='waiting_sources'").fetchall()
-            for row in list(rows)+list(waiting):
+            key,_=selected;group={}
+            waiting=c.execute("SELECT j.*,e.payload FROM jobs j JOIN events e USING(event_id) WHERE j.status IN ('waiting_sources','awaiting_source')").fetchall()
+            for row in (*rows,*waiting):
                 e=json.loads(row['payload'])
-                if groupkey(e)==key:group.append(dict(row))
+                if groupkey(e)==key:group[row['event_id']]=row
             token=uuid.uuid4().hex
-            for row in group:
-                c.execute("UPDATE jobs SET status='running',claim_token=?,worker_id=?,lease_until=?,attempts=attempts+1,updated_at=? WHERE event_id=?",(token,worker_id,until,stamp,row['event_id']))
+            for row in group.values():
+                c.execute("UPDATE jobs SET status='running',claim_token=?,worker_id=?,lease_until=?,attempts=attempts+?,updated_at=? WHERE event_id=?",(token,worker_id,until,int(row['status']!='awaiting_source'),stamp,row['event_id']))
             all_events=[json.loads(r['payload']) for r in c.execute('SELECT payload FROM events') if (lambda e:(e['stock_code'],e['kind'],e['language'])==key[:3])(json.loads(r['payload']))]
             classes={r['event_id']:dict(r) for r in c.execute('SELECT * FROM worker_classifications')}
-            return {'token':token,'event_ids':[r['event_id'] for r in group],'events':all_events,'classifications':classes,'lease_until':until}
+            return {'token':token,'event_ids':list(group),'events':all_events,'classifications':classes,'lease_until':until,
+                    'rechecking_sources':any(r['status']=='awaiting_source' for r in group.values()),
+                    'attempts':max(r['attempts']+1 for r in group.values())}
 
     def finish_claim(self,claim_token,status,reason=None,retry_seconds=0,now=None):
         from datetime import timedelta
-        if status not in {'pending','failed','blocked','needs_classification','waiting_sources','ready_for_delivery','complete'}:raise ValueError('Invalid worker status')
+        if status not in {'pending','failed','blocked','needs_classification','waiting_sources','awaiting_source','ready_for_delivery','complete'}:raise ValueError('Invalid worker status')
         with self.connect() as c:
             c.execute('BEGIN IMMEDIATE');self._worker_schema(c)
             current=now if now is not None else datetime.now(timezone.utc)
@@ -235,18 +246,22 @@ class StateStore:
             r=c.execute('SELECT * FROM research_runs WHERE research_id=?',(research_id,)).fetchone()
             return dict(r) if r else None
 
-    def finish_research_claim(self,token,research_id,payload,status,reason=None):
+    def finish_research_claim(self,token,research_id,payload,status,reason=None,*,retry_seconds=60):
         """Publish local research and release its job lease atomically."""
-        if status not in {'ready_for_delivery','blocked','material_only','revision_pending'}:raise ValueError('Invalid research outcome')
+        if status not in {'ready_for_delivery','blocked','material_only','revision_pending','awaiting_source'}:raise ValueError('Invalid research outcome')
+        if type(retry_seconds) is not int or not 1<=retry_seconds<=3600:raise ValueError('Invalid research retry interval')
         with self.connect() as c:
             c.execute('BEGIN IMMEDIATE');self._worker_schema(c)
             stamp=utcnow()
             from datetime import timedelta
-            continuing=status=='revision_pending'
-            job_status='pending' if continuing else ('complete' if status=='material_only' else status)
-            retry=(datetime.fromisoformat(stamp)+timedelta(seconds=60)).isoformat() if continuing else None
-            count=c.execute("UPDATE jobs SET status=?,reason=?,claim_token=NULL,worker_id=NULL,lease_until=NULL,retry_after=?,attempts=MAX(0,attempts-?),updated_at=? WHERE claim_token=? AND status='running' AND lease_until>?",(job_status,reason,retry,int(continuing),stamp,token,stamp)).rowcount
+            continuing=status in {'revision_pending','awaiting_source'}
+            job_status={'revision_pending':'pending','material_only':'complete'}.get(status,status)
+            retry=(datetime.fromisoformat(stamp)+timedelta(seconds=retry_seconds)).isoformat() if continuing else None
+            count=c.execute("UPDATE jobs SET status=?,reason=?,claim_token=NULL,worker_id=NULL,lease_until=NULL,retry_after=?,attempts=MAX(0,attempts-CASE WHEN reason IN ('authoritative_source_unresolved','official_download_retry','official_download_rate_limited') THEN 0 ELSE ? END),updated_at=? WHERE claim_token=? AND status='running' AND lease_until>?",(job_status,reason,retry,int(continuing),stamp,token,stamp)).rowcount
             if not count:return 0
+            logical_id=payload.get('event',{}).get('event_id')
+            if status=='ready_for_delivery' and logical_id:
+                c.execute("UPDATE research_runs SET status='superseded' WHERE status='ready_for_delivery' AND research_id<>? AND json_valid(payload) AND json_extract(payload,'$.event.event_id')=?",(research_id,logical_id))
             c.execute('INSERT INTO research_runs VALUES(?,?,?,?) ON CONFLICT(research_id) DO UPDATE SET payload=excluded.payload,status=excluded.status,updated_at=excluded.updated_at',(research_id,json.dumps(payload,ensure_ascii=False),status,stamp))
             return count
 
