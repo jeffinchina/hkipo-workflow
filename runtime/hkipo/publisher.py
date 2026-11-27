@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import re
 from .delivery import Deliverer,DeliveryError
+from .draft_covers import OfferDraftCovers
 from .quota import QuotaDeferred,QuotaUnavailable,quota_deferral
 from .release_worker import prepare_release,RenderUnavailable,WordLayoutRejected
 from .service import singleton_lock,write_json
@@ -29,10 +30,12 @@ class PublisherSettings:
     thumb_media_id:str|None=None
     poll_seconds:int=60
     max_jobs:int=2
+    offer_cover_paths:list=field(default_factory=list)
     def __post_init__(self):
         for key in ('enable_deliveries','production_accepted','acceptance_mode'):
             if type(getattr(self,key)) is not bool:raise ValueError('Explicit JSON booleans required')
         if not isinstance(self.accepted_event_ids,list) or any(not isinstance(x,str) or not x for x in self.accepted_event_ids):raise ValueError('Explicit acceptance event list required')
+        if not isinstance(self.offer_cover_paths,list) or any(not isinstance(path,str) or not path for path in self.offer_cover_paths):raise ValueError('Offer cover paths must be a list of local files')
         if not 1<=self.max_jobs<=10 or self.poll_seconds<15:raise ValueError('Invalid bounded publisher settings')
 
 
@@ -42,6 +45,7 @@ class Publisher:
         self.root.mkdir(parents=True,exist_ok=True,mode=0o700)
         self.store=StateStore(settings.state_db)
         self.preparer=preparer or prepare_release;self.deliverer=deliverer
+        self.offer_covers=OfferDraftCovers(self.store,settings.offer_cover_paths) if settings.offer_cover_paths else None
         with self.store.connect() as c:
             c.execute('BEGIN IMMEDIATE');self.store._worker_schema(c)
             c.execute('CREATE TABLE IF NOT EXISTS publication_runs(research_id TEXT PRIMARY KEY,status TEXT NOT NULL,report TEXT NOT NULL,retry_at REAL)')
@@ -106,13 +110,21 @@ class Publisher:
                     sender=self.deliverer or Deliverer(self.store,config_path=cfg.private_config)
                     try:email=sender.email(release)
                     except DeliveryError:email={'status':'blocked','error':'email_preparation_failed'}
-                    try:draft=sender.draft(release,thumb_media_id=cfg.thumb_media_id,update_existing=True)
-                    except DeliveryError:draft={'status':'blocked','error':'draft_preparation_failed'}
+                    try:
+                        cover={'thumb_media_id':cfg.thumb_media_id}
+                        if self.offer_covers is not None and not cfg.acceptance_mode:
+                            cover=self.offer_covers.select(release,payload['event'],cfg.thumb_media_id)
+                        draft=sender.draft(release,update_existing=True,**cover)
+                    except DeliveryError as exc:
+                        code=str(exc)
+                        draft={'status':'retryable','error':code} if code.startswith('offer_cover_') else {'status':'blocked','error':'draft_preparation_failed'}
                     confirmed={'confirmed','already_confirmed'}
                     report={'email':email,'draft':draft,'release_path':str(job/'release.json')}
                     outcomes={email.get('status'),draft.get('status')}
                     if 'retryable' in outcomes:
-                        results.append(self._retry(row,'delivery_preflight_retry',report))
+                        draft_reason=draft.get('error','')
+                        reason=draft_reason if draft_reason.startswith('offer_cover_') else 'delivery_preflight_retry'
+                        results.append(self._retry(row,reason,report))
                     else:
                         results.append(self._record(rid,'delivered' if outcomes<=confirmed else 'needs_attention',report))
                 except RenderUnavailable as exc:

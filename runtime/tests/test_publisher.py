@@ -27,11 +27,13 @@ class PublisherTests(unittest.TestCase):
         status = json.loads((job / 'status.json').read_text())
         return {'event_id': 'event-' + job.name, 'request_id': status['request_id']}
 
-    def add(self, number, baseline=0, malformed=False, status_request='r1'):
+    def add(self, number, baseline=0, malformed=False, status_request='r1', episode_id=None):
         rid = f'{number:064x}'; job = self.research / rid; job.mkdir()
         (job / 'status.json').write_text(json.dumps({'status': 'ready_for_delivery', 'request_id': status_request}))
         payload = {'event': {'event_id': 'event-' + rid, 'source_event_ids': ['source-' + rid]},
                    'writer_result': {'request_id': 'r1'}}
+        if episode_id:
+            payload['event']['episode_id']=episode_id
         with self.publisher.store.connect() as c:
             c.execute('INSERT INTO events VALUES(?,?,?,?)', ('source-' + rid, '{}', baseline, str(number)))
             c.execute('INSERT INTO jobs(event_id,status,updated_at) VALUES(?,?,?)', ('source-' + rid, 'ready_for_delivery', str(number)))
@@ -115,6 +117,22 @@ class PublisherTests(unittest.TestCase):
         self.assertEqual(self.publisher.cycle()['results'][0]['reason'],'delivery_preflight_retry')
         with self.publisher.store.connect() as c:c.execute('UPDATE publication_runs SET retry_at=0 WHERE research_id=?',(rid,))
         self.assertEqual(self.publisher.cycle()['results'][0]['status'],'delivered')
+
+    def test_offer_drafts_use_separate_covers_and_email_continues_when_pool_is_exhausted(self):
+        self.enable();self.settings.thumb_media_id='primary-cover'
+        alternate=self.root/'alternate.jpg';alternate.write_bytes(b'distinct-cover-fixture')
+        self.settings.offer_cover_paths=[str(alternate)]
+        self.publisher=Publisher(self.settings,preparer=self.preparer,deliverer=self.sender)
+        for number in range(1,4):
+            self.add(number,episode_id=f'ipo-{number:05d}-2026-11-27-0123456789ab')
+        self.assertEqual([r['status'] for r in self.publisher.cycle()['results']],['delivered','delivered'])
+        last=self.publisher.cycle()['results'][0]
+        self.assertEqual((last['status'],last['reason']),('deferred','offer_cover_pool_exhausted'))
+        self.assertEqual(self.sender.email.call_count,3)
+        first,second=self.sender.draft.call_args_list
+        self.assertNotEqual(first.args[0]['event_id'],second.args[0]['event_id'])
+        self.assertEqual(first.kwargs,{'update_existing':True,'thumb_media_id':'primary-cover'})
+        self.assertEqual(second.kwargs,{'update_existing':True,'cover_path':str(alternate.resolve()),'cover_authorized':True})
 
     def test_verified_quota_deferral_persists_retry_and_stops_cycle(self):
         first = self.add(1); self.add(2)
