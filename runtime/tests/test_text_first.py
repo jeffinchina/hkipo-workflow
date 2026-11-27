@@ -83,7 +83,13 @@ class TextFirstTests(unittest.TestCase):
         self.assertEqual(status['status'], 'ready_for_delivery', status)
         self.assertEqual(status['source_mode'], 'text_first')
         self.assertEqual([c[0] for c in calls], ['draft', 'review'])
+        for name, prompt, _ in calls:
+            with self.subTest(name=name):
+                self.assertIn('发行方案用本次条款支持的最短表述', prompt)
+                self.assertIn('发行数量只写初始香港公开发售手数', prompt)
+                self.assertIn('引用条件上限时，保留最短的实质条件', prompt)
         self.assertIn('先核原文', calls[1][1])
+        self.assertIn('若发行情况仍明显重复或堆砌常规条款，独立复核应给出 needs_revision', calls[1][1])
         self.assertIn('Page two allocation data 200', calls[1][1])
         self.assertNotIn('上一轮未通过', calls[1][1])
         manifest = json.loads((self.root / 'job/sources/manifest.json').read_text())

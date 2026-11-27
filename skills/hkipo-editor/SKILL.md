@@ -5,7 +5,7 @@ description: 根据完整官方原文和作者当次输入，撰写、修订或�
 
 产出自然可读的简体中文稿，事实可回到原文的实体、期间、单位和页码。默认可读取本次任务已授权材料、写本地成果，无需逐文件再次询问。使用用户选择的Codex CLI既有登录及额度；不改用API密钥或其他模型服务。
 
-按事件读一个体裁参考：[新股发售](references/offer.md)、[分配结果](references/allotment.md)、[异常事件](references/exception.md)。新股申购必须使用offer参考v3.0，分别核对事实与作者成稿风格；绿鞋、基石等须在底稿完成核验，正文按v3.0简洁呈现；不要求复述通用条件或异常核验链路。共同写法与排版见[风格与渲染](references/style.md)，事实及产物交接见[证据与契约](references/evidence-contract.md)。
+按事件读一个体裁参考：[新股发售](references/offer.md)、[分配结果](references/allotment.md)、[异常事件](references/exception.md)。新股申购使用 offer 参考 v3.1，分别核对事实和面向读者的取舍。发行情况保留十行，发行方案用最短的有据机制表述。草稿和独立复核均按该规范执行。共同写法与排版见[风格与渲染](references/style.md)，事实及产物交接见[证据与契约](references/evidence-contract.md)。
 
 先确认完整原文可达并记录页coverage；截头、关键词片段、目录命中不能替代完整输入。将事实、推导、观点、作者当次个人信息分开。未定位不等于没有，缺少硬字段时保留缺口并暂停可发送状态，不猜。没有依据的行动指令省略；延期短讯不因可选退款细节或未使用的旧招股书缺失而停稿，具体见异常事件参考。
 
